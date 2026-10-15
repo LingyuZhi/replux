@@ -1,0 +1,22 @@
+# Personal documents
+my_docs/
+docs/
+
+# Developing AGENTS.md
+AGENTS.md
+
+# Developing documents
+.scratch/
+CONTEXT.md
+
+# Python artifacts and local credentials
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+dist/
+.env
+.env.*
+config.yaml
