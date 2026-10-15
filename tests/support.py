@@ -8,7 +8,9 @@ from typing import Any
 import httpx2 as httpx
 
 
-def reply_events() -> list[dict[str, Any]]:
+def reply_events(protocol: str = "anthropic", *, refusal: bool = False) -> list[dict[str, Any]]:
+    if protocol == "openai":
+        return responses_events(refusal=refusal)
     return [
         {
             "type": "message_start",
@@ -24,12 +26,51 @@ def reply_events() -> list[dict[str, Any]]:
             },
         },
         {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "你好"}},
-        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "，世界\n"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "抱歉，" if refusal else "你好"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "无法回答。\n" if refusal else "，世界\n"}},
         {"type": "content_block_stop", "index": 0},
-        {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 5}},
+        {"type": "message_delta", "delta": {"stop_reason": "refusal" if refusal else "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 5}},
         {"type": "message_stop"},
     ]
+
+
+def responses_events(*, refusal: bool = False) -> list[dict[str, Any]]:
+    kind = "refusal" if refusal else "output_text"
+    text_key = "refusal" if refusal else "text"
+    chunks = ["抱歉，", "无法回答。\n"] if refusal else ["你好", "，世界\n"]
+    text_fields: dict[str, Any] = {} if refusal else {"annotations": [], "logprobs": []}
+    part = {"type": kind, text_key: "".join(chunks), **text_fields}
+    message = {
+        "id": "msg_offline", "type": "message", "role": "assistant",
+        "status": "completed", "content": [part],
+    }
+    response = {
+        "id": "resp_offline", "object": "response", "created_at": 1,
+        "status": "completed", "model": "custom-model-20261001",
+        "output": [message], "error": None, "incomplete_details": None,
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
+        "usage": {
+            "input_tokens": 11, "output_tokens": 5, "total_tokens": 16,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    }
+    position = {"item_id": "msg_offline", "output_index": 0, "content_index": 0}
+    events: list[dict[str, Any]] = [
+        {"type": "response.created", "response": {**response, "status": "in_progress", "output": [], "usage": None}},
+        {"type": "response.in_progress", "response": {**response, "status": "in_progress", "output": [], "usage": None}},
+        {"type": "response.output_item.added", "output_index": 0, "item": {**message, "status": "in_progress", "content": []}},
+        {"type": "response.content_part.added", **position, "part": {**part, text_key: ""}},
+        {"type": f"response.{kind}.delta", **position, "delta": chunks[0], **({} if refusal else {"logprobs": []})},
+        {"type": f"response.{kind}.delta", **position, "delta": chunks[1], **({} if refusal else {"logprobs": []})},
+        {"type": f"response.{kind}.done", **position, text_key: "".join(chunks), **({} if refusal else {"logprobs": []})},
+        {"type": "response.content_part.done", **position, "part": part},
+        {"type": "response.output_item.done", "output_index": 0, "item": message},
+        {"type": "response.completed", "response": response},
+    ]
+    for sequence_number, event in enumerate(events):
+        event["sequence_number"] = sequence_number
+    return events
 
 
 class ControlledSSE(httpx.AsyncByteStream):

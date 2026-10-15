@@ -1,6 +1,6 @@
 # Replux
 
-Replux 是一个终端 AI 助手。目前支持通过 Anthropic Messages 完成单轮流式问答。
+Replux 是一个终端 AI 助手。支持通过 Anthropic Messages 或 OpenAI Responses 完成单轮流式问答。
 每次提问独立发送，回复正文会随生成过程显示。
 
 需要 Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)。
@@ -20,6 +20,17 @@ api_key: your-api-key
 max_output_tokens: 8192
 timeout_seconds: 120
 ```
+
+使用 OpenAI Responses 时，将配置改为：
+
+```yaml
+protocol: openai
+model: your-full-openai-model-id
+base_url: https://api.openai.com/v1
+api_key: your-api-key
+```
+
+OpenAI 请求使用 `store: false`。OpenAI 配置不接受 Anthropic 专用的 `thinking` 字段。
 
 也可以指定另一份配置，或通过 Python 模块启动：
 

@@ -59,13 +59,15 @@ def load_config(path: Path | None = None) -> ProviderConfig:
 
     if not isinstance(values, dict):
         raise ConfigError("配置必须是 YAML 字段映射。")
+    if values.get("protocol") == "openai" and "thinking" in values:
+        raise ConfigError("OpenAI 配置不支持 Anthropic 专用的 thinking 字段。")
     allowed = {"protocol", "model", "base_url", "api_key", "max_output_tokens", "timeout_seconds"}
     if values.keys() - allowed:
         raise ConfigError("配置含未知字段；支持 protocol、model、base_url、api_key、max_output_tokens、timeout_seconds。")
 
     protocol = _required_string(values, "protocol")
-    if protocol != "anthropic":
-        raise ConfigError("protocol 当前仅支持 anthropic。")
+    if protocol not in {"anthropic", "openai"}:
+        raise ConfigError("protocol 仅支持 anthropic 或 openai。")
     model = _required_string(values, "model")
     base_url = _required_string(values, "base_url")
     api_key = _required_string(values, "api_key")

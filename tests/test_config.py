@@ -16,10 +16,11 @@ VALID_YAML = (
 )
 
 
-def test_config_preserves_connection_values_and_sets_defaults(tmp_path: Path) -> None:
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+def test_config_preserves_connection_values_and_sets_defaults(tmp_path: Path, protocol: str) -> None:
     path = tmp_path / "provider.yaml"
     path.write_text(
-        "protocol: anthropic\n"
+        f"protocol: {protocol}\n"
         "model: custom-model-20261001\n"
         "base_url: https://gateway.example/anthropic/v2\n"
         "api_key: ${LITERAL_KEY}\n",
@@ -28,7 +29,7 @@ def test_config_preserves_connection_values_and_sets_defaults(tmp_path: Path) ->
 
     config = load_config(path)
 
-    assert config.protocol == "anthropic"
+    assert config.protocol == protocol
     assert config.model == "custom-model-20261001"
     assert config.base_url == "https://gateway.example/anthropic/v2"
     assert config.api_key == "${LITERAL_KEY}"
@@ -56,7 +57,6 @@ def test_config_preserves_connection_values_and_sets_defaults(tmp_path: Path) ->
         VALID_YAML + "timeout_seconds: .inf\n",
         VALID_YAML + "timeout_seconds: '10'\n",
         VALID_YAML.replace("protocol: anthropic", "protocol: unknown"),
-        VALID_YAML.replace("protocol: anthropic", "protocol: openai"),
         VALID_YAML.replace("model: custom-model-20261001\n", ""),
         VALID_YAML.replace("model: custom-model-20261001", "model: '  '"),
         VALID_YAML.replace("model: custom-model-20261001", "model: 42"),
@@ -119,6 +119,28 @@ def test_missing_config_reports_a_configuration_error(tmp_path: Path) -> None:
         create_app(["--config", str(tmp_path / "missing.yaml")], transport=transport)
     assert exit_error.value.code == 2
     assert transport.requests == []
+
+
+@pytest.mark.parametrize("thinking", ["{type: enabled, budget_tokens: 1024}", "{type: adaptive}", "{type: disabled}", "null"])
+def test_openai_thinking_fails_before_chat_or_request(
+    tmp_path: Path, thinking: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "openai.yaml"
+    path.write_text(
+        VALID_YAML.replace("protocol: anthropic", "protocol: openai") + f"thinking: {thinking}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="thinking"):
+        load_config(path)
+    transport = RecordingTransport(ControlledSSE())
+    with pytest.raises(SystemExit) as caught:
+        create_app(["--config", str(path)], transport=transport)
+    assert caught.value.code == 2
+    assert transport.requests == []
+    captured = capsys.readouterr()
+    assert "thinking" in captured.err
+    assert "test-secret-never-display" not in captured.err
+    assert "\x1b[?1049h" not in captured.out
 
 
 def test_explicit_config_replaces_default_and_is_loaded_once(

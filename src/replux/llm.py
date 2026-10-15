@@ -1,4 +1,4 @@
-"""Provider-independent reply events and the Anthropic adapter."""
+"""Provider-independent reply events and streaming protocol adapters."""
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
@@ -8,6 +8,8 @@ from typing import Self
 
 from anthropic import APIError, AsyncAnthropic, DefaultAsyncHttpxClient
 import httpx2 as httpx
+import openai
+from openai.types.responses import Response
 
 from replux.config import ProviderConfig
 
@@ -118,9 +120,74 @@ class AnthropicClient(LLMClient):
         await self._sdk.close()
 
 
+class OpenAIClient(LLMClient):
+    def __init__(
+        self, config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
+    ) -> None:
+        self._config = config
+        self._active = False
+        self._sdk = openai.AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=config.timeout_seconds,
+            max_retries=0,
+            http_client=openai.DefaultAsyncHttpxClient(transport=transport) if transport else None,
+        )
+
+    async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
+        if self._active:
+            raise RuntimeError("已有进行中的回复。")
+        self._active = True
+        try:
+            final: Response | None = None
+            async with await self._sdk.responses.create(
+                model=self._config.model,
+                max_output_tokens=self._config.max_output_tokens,
+                input=[{"role": "user", "content": user_input}],
+                store=False,
+                stream=True,
+            ) as stream:
+                async for event in stream:
+                    if event.type in {"response.output_text.delta", "response.refusal.delta"}:
+                        yield TextDelta(event.delta)
+                    elif event.type == "response.completed":
+                        final = event.response
+                        break
+                    elif event.type == "response.incomplete":
+                        raise LLMError("回复未完成：输出达到上限或响应被中断。")
+                    elif event.type in {"response.failed", "error"}:
+                        raise LLMError("模型请求失败，服务端未完成回复。")
+                    elif event.type in {"response.output_item.added", "response.output_item.done"}:
+                        if event.item.type not in {"message", "reasoning"}:
+                            raise LLMError("当前版本不支持工具请求。")
+            if final is None or final.status != "completed":
+                raise LLMError("回复未完成：缺少完整的结束信号。")
+            for item in final.output:
+                if item.type not in {"message", "reasoning"}:
+                    raise LLMError("当前版本不支持工具请求。")
+                if item.type == "message" and item.status != "completed":
+                    raise LLMError("回复未完成：正文尚未完成。")
+            usage = final.usage
+            yield ReplyCompleted(
+                final.status,
+                getattr(usage, "input_tokens", None),
+                getattr(usage, "output_tokens", None),
+            )
+        except (openai.APIError, httpx.HTTPError) as error:
+            # Keep the cause for callers, but never display a server's error body.
+            raise LLMError("模型请求失败，请检查连接配置或服务状态。") from error
+        finally:
+            self._active = False
+
+    async def aclose(self) -> None:
+        await self._sdk.close()
+
+
 def create_client(
     config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
 ) -> LLMClient:
     if config.protocol == "anthropic":
         return AnthropicClient(config, transport=transport)
-    raise ValueError("Unsupported protocol; this version supports anthropic.")
+    if config.protocol == "openai":
+        return OpenAIClient(config, transport=transport)
+    raise ValueError("Unsupported protocol; expected anthropic or openai.")

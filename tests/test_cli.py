@@ -14,12 +14,13 @@ import pytest
 from tests.test_config import VALID_YAML
 
 
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
 @pytest.mark.parametrize("entry", ["command", "module"])
 def test_public_entry_opens_full_screen_and_restores_terminal(
-    tmp_path: Path, entry: str
+    tmp_path: Path, entry: str, protocol: str
 ) -> None:
     config = tmp_path / "provider.yaml"
-    config.write_text(VALID_YAML, encoding="utf-8")
+    config.write_text(VALID_YAML.replace("protocol: anthropic", f"protocol: {protocol}"), encoding="utf-8")
     command = (
         [str(Path(sys.executable).with_name("replux"))]
         if entry == "command"
