@@ -7,11 +7,13 @@ import sys
 
 import pytest
 import httpx2 as httpx
+from textual.containers import VerticalScroll
+from textual.events import Key, Paste
 from textual.worker import WorkerCancelled, WorkerFailed
-from textual.widgets import Collapsible, Input, Static
+from textual.widgets import Collapsible, Static, TextArea
 
 from replux.cli import create_app
-from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta, create_client
+from replux.llm import LLMClient, LLMError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta, create_client
 from replux.tui import RepluxApp
 from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events, thinking_events, unfinished_events
 from tests.test_config import VALID_YAML
@@ -41,8 +43,8 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
     client = ScriptedClient()
     app = RepluxApp(client)
     async with app.run_test(size=(80, 24)) as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "first"
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "first"
         await pilot.press("enter")
         await asyncio.wait_for(client.reached[0].wait(), timeout=2)
         assert not app.query(Collapsible)
@@ -55,7 +57,12 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
         assert thinking.collapsed
         assert str(title.content) == "+ Thinking"
         assert "先分析" not in app.export_screenshot()
-        prompt.value = "next draft"
+        await pilot.press(*"下一条", "ctrl+j")
+        app.post_message(Paste("  draft"))
+        await pilot.pause()
+        await pilot.press("enter", "enter", "enter")
+        assert client.inputs == ["first"]
+        assert prompt.text == "下一条\n  draft"
 
         await pilot.click(title, offset=(1, 0))
         assert not thinking.collapsed
@@ -78,7 +85,7 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
         assert not thinking.collapsed
         assert "再回答" in app.export_screenshot()
         assert client.inputs == ["first"]
-        assert prompt.value == "next draft"
+        assert prompt.text == "下一条\n  draft"
 
         client.release[2].set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -86,7 +93,7 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
         await pilot.press("enter")
         assert thinking.collapsed
         assert client.inputs == ["first"]
-        assert prompt.value == "next draft"
+        assert prompt.text == "下一条\n  draft"
         await pilot.press("enter")
         prompt.focus()
         await pilot.press("enter")
@@ -95,8 +102,113 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
         assert len(regions) == 2
         assert not regions[0].collapsed
         assert regions[1].collapsed
-        assert client.inputs == ["first", "next draft"]
+        assert client.inputs == ["first", "下一条\n  draft"]
     assert client.closed
+
+
+@pytest.mark.parametrize("channel", ["reply", "thinking"])
+@pytest.mark.parametrize("ending", ["success", "error", "cancel"])
+async def test_streaming_follows_bottom_and_preserves_old_transcript_while_editing(
+    channel: str, ending: str,
+) -> None:
+    class ScriptedClient(LLMClient):
+        def __init__(self) -> None:
+            self.inputs: list[str] = []
+            self.reached = [asyncio.Event() for _ in range(5)]
+            self.release = [asyncio.Event() for _ in range(5)]
+
+        async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
+            self.inputs.append(user_input)
+            delta = TextDelta if channel == "reply" else ThinkingDelta
+            chunks = [
+                ThinkingDelta("Thinking starts here\n"),
+                delta("".join(f"旧记录 {line}\n" for line in range(60))),
+                delta("更多内容\n" * 10),
+                delta("阅读时继续生成\n" * 10),
+                delta("回到底部后继续跟随\n" * 10),
+            ]
+            for index, chunk in enumerate(chunks):
+                yield chunk
+                self.reached[index].set()
+                await self.release[index].wait()
+            if ending == "error":
+                raise LLMError("offline failure")
+            yield ReplyCompleted("end_turn", None, None)
+
+        async def aclose(self) -> None:
+            pass
+
+    client = ScriptedClient()
+    app = RepluxApp(client)
+    async with app.run_test(size=(80, 24)) as pilot:
+        prompt = app.query_one("#prompt", TextArea)
+        transcript = app.query_one("#transcript", VerticalScroll)
+        await pilot.press(*"问题", "enter")
+        await asyncio.wait_for(client.reached[0].wait(), timeout=2)
+        await pilot.pause()
+        await pilot.press("shift+tab", "enter")
+        assert not app.query_one(Collapsible).collapsed
+        prompt.focus()
+
+        for index in [1, 2]:
+            client.release[index - 1].set()
+            await asyncio.wait_for(client.reached[index].wait(), timeout=2)
+            await pilot.pause()
+            assert transcript.max_scroll_y > 0
+            assert transcript.is_vertical_scroll_end
+
+        transcript.focus()
+        await pilot.press("pageup")
+        await pilot.wait_for_scheduled_animations()
+        assert not transcript.is_vertical_scroll_end
+        reading_position = transcript.scroll_y
+        prompt.focus()
+        await pilot.press(*"草稿", "ctrl+j", *"仍可编辑", "enter", "enter")
+        assert prompt.text == "草稿\n仍可编辑"
+        assert client.inputs == ["问题"]
+        assert transcript.scroll_y == reading_position
+
+        client.release[2].set()
+        await asyncio.wait_for(client.reached[3].wait(), timeout=2)
+        await pilot.pause()
+        assert transcript.scroll_y == reading_position
+        assert not transcript.is_vertical_scroll_end
+        assert app.query_one("#status", Static).content == "Generating..."
+        assert prompt.region.bottom == 24
+        assert transcript.region.bottom <= app.query_one("#composer").region.y
+
+        transcript.focus()
+        await pilot.press("pagedown", "pagedown", "pagedown")
+        await pilot.wait_for_scheduled_animations()
+        assert transcript.is_vertical_scroll_end
+        prompt.focus()
+        client.release[3].set()
+        await asyncio.wait_for(client.reached[4].wait(), timeout=2)
+        await pilot.pause()
+        assert transcript.is_vertical_scroll_end
+        assert "回到底部后继续跟随" in app.export_screenshot()
+
+        transcript.focus()
+        await pilot.press("pageup")
+        await pilot.wait_for_scheduled_animations()
+        reading_position = transcript.scroll_y
+        prompt.focus()
+        if ending == "cancel":
+            worker = next(iter(app.workers))
+            await pilot.press("ctrl+c")
+            with pytest.raises(WorkerCancelled):
+                await asyncio.wait_for(worker.wait(), timeout=2)
+            assert app.query_one(".turn-status", Static).content == "Cancelled"
+        else:
+            client.release[4].set()
+            await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+            if ending == "error":
+                assert app.query_one(".turn-status", Static).content == "Request failed: offline failure"
+        await pilot.pause()
+        assert transcript.scroll_y == reading_position
+        assert app.query_one("#status", Static).content == "Ready"
+        assert client.inputs == ["问题"]
+        assert prompt.text == "草稿\n仍可编辑"
 
 
 @pytest.mark.parametrize("configured", [False, True], ids=["model-default", "summarized"])
@@ -113,8 +225,8 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
     app = create_app(["--config", str(path)], transport=transport)
 
     async with app.run_test(size=(80, 24)) as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "first"
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "first"
         await pilot.press("enter")
         await asyncio.wait_for(stream.blocked.wait(), timeout=2)
         await pilot.pause()
@@ -154,7 +266,7 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
 
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         prompt.focus()
-        prompt.value = "follow-up"
+        prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert app.query_one("#status", Static).content == "Ready"
@@ -187,7 +299,7 @@ async def test_no_thinking_control_without_displayable_api_text(tmp_path: Path, 
     app = create_app(["--config", str(path)], transport=transport)
 
     async with app.run_test() as pilot:
-        app.query_one("#prompt", Input).value = "hello"
+        app.query_one("#prompt", TextArea).text = "hello"
         await pilot.press("enter")
         await asyncio.wait_for(stream.blocked.wait(), timeout=2)
         await pilot.pause()
@@ -215,15 +327,15 @@ async def test_yaml_to_sdk_to_visible_reply_before_terminal_event(
     app = create_app(["--config", str(config)], transport=transport)
 
     async with app.run_test(size=(80, 24)) as pilot:
-        prompt = app.query_one("#prompt", Input)
+        prompt = app.query_one("#prompt", TextArea)
         assert prompt.region.bottom == 24
         assert app.query_one("#status", Static).region.bottom <= prompt.region.y
-        prompt.value = "  "
+        prompt.text = "  "
         await pilot.press("enter")
         assert transport.requests == []
         assert not app.query(".reply")
 
-        prompt.value = "你好，Replux"
+        prompt.text = "你好，Replux"
         await pilot.press("enter")
         await asyncio.wait_for(stream.blocked.wait(), timeout=2)
         await pilot.pause()
@@ -233,10 +345,10 @@ async def test_yaml_to_sdk_to_visible_reply_before_terminal_event(
         assert not stream.closed
         assert len(transport.requests) == 1
 
-        prompt.value = "下一条草稿"
+        prompt.text = "下一条草稿"
         await pilot.press("enter")
         assert len(transport.requests) == 1
-        assert prompt.value == "下一条草稿"
+        assert prompt.text == "下一条草稿"
 
         stream.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -274,7 +386,7 @@ async def test_selected_yaml_controls_actual_request_until_restart(
     selected.write_text("protocol: changed-after-startup\n", encoding="utf-8")
 
     async with app.run_test() as pilot:
-        app.query_one("#prompt", Input).value = "one question"
+        app.query_one("#prompt", TextArea).text = "one question"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert app.query_one(".reply", Static).content == "你好，世界\n"
@@ -306,7 +418,7 @@ async def test_tui_accepts_a_scripted_llm_client_and_preserves_input() -> None:
 
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
             self.inputs.append(user_input)
-            yield TextDelta("[bold]这仍是正文[/bold]\n")
+            yield TextDelta("[bold]这仍是正文[/bold]\n```python\n    print('你好')\n```\n")
             yield ReplyCompleted("end_turn", None, None)
 
         async def aclose(self) -> None:
@@ -315,17 +427,46 @@ async def test_tui_accepts_a_scripted_llm_client_and_preserves_input() -> None:
     client = ScriptedClient()
     app = RepluxApp(client)
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "   "
-        await pilot.press("enter")
+        await pilot.press("space", "ctrl+j", "space", "enter")
         assert client.inputs == []
-        prompt.value = "  [red]原样提问[/red]  "
+        assert not app.query(".user, .reply")
+        await pilot.press("backspace", "backspace", "backspace")
+        await pilot.press(*"中文问题", "ctrl+j")
+        app.post_message(Paste("  [red]原样提问[/red]\n\tprint('你好')\n\n  "))
+        await pilot.pause()
+        assert client.inputs == []
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        assert client.inputs == ["  [red]原样提问[/red]  "]
-        assert app.query_one(".reply", Static).content == "[bold]这仍是正文[/bold]\n"
+        expected = "中文问题\n  [red]原样提问[/red]\n\tprint('你好')\n\n  "
+        assert client.inputs == [expected]
+        assert app.query_one(".user", Static).content == expected
+        assert app.query_one(".reply", Static).content == "[bold]这仍是正文[/bold]\n```python\n    print('你好')\n```\n"
+        assert "[bold]这仍是正文[/bold]" in app.export_screenshot()
+        assert "```python" in app.export_screenshot()
         await pilot.press("ctrl+c")
     assert client.closed
+
+
+async def test_batched_typing_newline_paste_and_enter_keep_their_order() -> None:
+    class ScriptedClient(LLMClient):
+        def __init__(self) -> None:
+            self.inputs: list[str] = []
+
+        async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
+            self.inputs.append(user_input)
+            yield ReplyCompleted("end_turn", None, None)
+
+        async def aclose(self) -> None:
+            pass
+
+    client = ScriptedClient()
+    app = RepluxApp(client)
+    async with app.run_test() as pilot:
+        for event in [Key("a", "a"), Key("ctrl+j", "\n"), Paste("  b\n\tc\n"), Key("enter", "\r")]:
+            app.post_message(event)
+        await pilot.pause()
+        assert client.inputs == ["a\n  b\n\tc\n"]
+        assert app.query_one("#prompt", TextArea).text == ""
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
@@ -355,20 +496,20 @@ async def test_request_error_preserves_transcript_and_draft_without_rendering_cr
 
     app = create_app(["--config", str(config)], transport=httpx.MockTransport(respond))
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "first"
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "first"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        prompt.value = "failed"
+        prompt.text = "failed"
         await pilot.press("enter")
         await asyncio.wait_for(failing.wait(), timeout=2)
-        prompt.value = "follow-up"
+        prompt.text = "follow-up"
         release_failure.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert app.is_running
         assert "Request failed" in str(app.query_one(".turn-status", Static).content)
         assert app.query_one("#status", Static).content == "Ready"
-        assert prompt.value == "follow-up"
+        assert prompt.text == "follow-up"
         assert len(requests) == 2
         assert "test-secret-never-display" not in app.export_screenshot()
         await pilot.press("enter")
@@ -398,22 +539,25 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
     transport = RecordingTransport(streams)
     app = RepluxApp(create_client(provider_config(protocol), transport=transport))
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "first"
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "first"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        prompt.value = "cancelled"
+        prompt.text = "cancelled"
         await pilot.press("enter")
         await asyncio.wait_for(pending.blocked.wait(), timeout=2)
         worker = next(iter(app.workers))
-        prompt.value = "follow-up"
+        prompt.text = "follow-up"
+        prompt.select_all()
+        app.copy_to_clipboard("unchanged")
         try:
             await pilot.press("ctrl+c")
             await asyncio.wait_for(pending.closing.wait(), timeout=2)
             assert app.is_running
             assert not pending.closed
             assert app.query_one("#status", Static).content == "Cancelling..."
-            assert prompt.value == "follow-up"
+            assert prompt.text == "follow-up"
+            assert app.clipboard == "unchanged"
             await pilot.press("enter", "ctrl+c")
             assert len(transport.requests) == 2
             assert not pending.closed
@@ -426,7 +570,7 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
         assert app.query_one("#status", Static).content == "Ready"
         assert "Cancelled" in str(app.query_one(".turn-status", Static).content)
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好" if partial else ""]
-        assert prompt.value == "follow-up"
+        assert prompt.text == "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert len(app.query(".reply")) == 3
@@ -455,7 +599,7 @@ async def test_exit_waits_for_in_progress_stream_cleanup(
 
     async def session() -> None:
         async with app.run_test() as pilot:
-            app.query_one("#prompt", Input).value = "hello"
+            app.query_one("#prompt", TextArea).text = "hello"
             await pilot.press("enter")
             await asyncio.wait_for(stream.blocked.wait(), timeout=2)
             if cancel_first:
@@ -484,7 +628,7 @@ async def test_programming_error_terminates_chat_and_releases_resources(protocol
     app = RepluxApp(create_client(provider_config(protocol), transport=transport))
     with pytest.raises(WorkerFailed, match="injected defect"):
         async with app.run_test() as pilot:
-            app.query_one("#prompt", Input).value = "hello"
+            app.query_one("#prompt", TextArea).text = "hello"
             await pilot.press("enter")
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
     assert app.return_code == 1
@@ -502,14 +646,14 @@ def test_immediate_exit_does_not_leave_an_unobserved_reply_task(protocol: str) -
 import asyncio
 import gc
 import sys
-from textual.widgets import Input
+from textual.widgets import TextArea
 from replux.llm import create_client
 from replux.tui import RepluxApp
 from tests.support import ControlledSSE, RecordingTransport, provider_config, reply_events
 
 class ExitOnSubmitApp(RepluxApp):
-    def on_input_submitted(self, event):
-        super().on_input_submitted(event)
+    def action_submit_prompt(self):
+        super().action_submit_prompt()
         self.exit()
 
 async def session():
@@ -518,7 +662,7 @@ async def session():
     transport = RecordingTransport(stream)
     app = ExitOnSubmitApp(create_client(provider_config(protocol), transport=transport))
     async with app.run_test() as pilot:
-        app.query_one('#prompt', Input).value = 'hello'
+        app.query_one('#prompt', TextArea).text = 'hello'
         await pilot.press('enter')
     print(app.return_code, transport.closed, len(transport.requests))
 
@@ -545,16 +689,16 @@ async def test_incomplete_turn_stays_visible_and_out_of_next_request(
     ])
     app = create_app(["--config", str(config)], transport=transport)
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
+        prompt = app.query_one("#prompt", TextArea)
         for user_input in ["first", "unfinished"]:
-            prompt.value = user_input
+            prompt.text = user_input
             await pilot.press("enter")
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert incomplete.closed
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好，世界\n"]
         assert "Reply incomplete" in str(app.query_one(".turn-status", Static).content)
         assert app.query_one("#status", Static).content == "Ready"
-        prompt.value = "follow-up"
+        prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert len(app.query(".reply")) == 3
@@ -582,7 +726,7 @@ async def test_recreated_app_starts_with_empty_conversation(tmp_path: Path, prot
             assert not app.query(".user, .reply")
             expected = []
             for question in questions:
-                app.query_one("#prompt", Input).value = question
+                app.query_one("#prompt", TextArea).text = question
                 await pilot.press("enter")
                 await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
                 expected.append({"role": "user", "content": question})

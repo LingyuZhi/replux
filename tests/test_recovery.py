@@ -6,7 +6,7 @@ import anthropic
 import httpx2 as httpx
 import openai
 import pytest
-from textual.widgets import Input, Static
+from textual.widgets import Static, TextArea
 
 from replux.llm import AuthenticationError, LLMError, NetworkError, RateLimitError, StreamEvent, TextDelta, create_client
 from replux.tui import RepluxApp
@@ -207,20 +207,20 @@ async def test_partial_failure_keeps_visible_text_and_draft_then_uses_only_compl
     transport = RecordingTransport(streams)
     app = RepluxApp(create_client(config, transport=transport))
     async with app.run_test() as pilot:
-        prompt = app.query_one("#prompt", Input)
-        prompt.value = "first"
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "first"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        prompt.value = "failed"
+        prompt.text = "failed"
         await pilot.press("enter")
         await asyncio.wait_for(pending.blocked.wait(), timeout=2)
-        prompt.value = "follow-up"
+        prompt.text = "follow-up"
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好"]
         pending.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert pending.closed
         assert app.is_running
-        assert prompt.value == "follow-up"
+        assert prompt.text == "follow-up"
         assert app.query_one("#status", Static).content == "Ready"
         assert "Request failed" in str(app.query_one(".turn-status", Static).content)
         assert config.api_key not in app.export_screenshot()

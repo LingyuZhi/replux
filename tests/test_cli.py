@@ -28,7 +28,8 @@ def test_public_entry_opens_full_screen_and_restores_terminal(
     )
     injected = entry in {"cancel", "defect", "early-exit"}
     if injected:
-        command = [sys.executable, "-c", """
+        command = [sys.executable, "-c", r"""
+import json
 import os
 import replux.cli as cli
 from replux.tui import RepluxApp
@@ -38,8 +39,8 @@ protocol = os.environ["REPLUX_TEST_PROTOCOL"]
 scenario = os.environ["REPLUX_TEST_SCENARIO"]
 if scenario == "early-exit":
     class ExitingApp(RepluxApp):
-        def on_input_submitted(self, event):
-            super().on_input_submitted(event)
+        def action_submit_prompt(self):
+            super().action_submit_prompt()
             self.exit()
     cli.RepluxApp = ExitingApp
 gate = 2 if protocol == "anthropic" else 4
@@ -52,6 +53,11 @@ stream = ControlledSSE(
 transport = RecordingTransport(stream)
 app = cli.create_app(transport=transport)
 app.run()
+if transport.requests:
+    field = "messages" if protocol == "anthropic" else "input"
+    assert json.loads(transport.requests[0].content)[field] == [
+        {"role": "user", "content": "中文问题\n  code()\n\tlast\n\n  "},
+    ]
 print(f"REPLUX_RESOURCES:{stream.closed}:{transport.closed}:{len(transport.requests)}", flush=True)
 raise SystemExit(app.return_code)
 """]
@@ -78,11 +84,11 @@ raise SystemExit(app.return_code)
             output.extend(os.read(master, 65536))
 
     try:
-        read_until("Type a message".encode())
+        read_until(b"Enter to send")
         assert b"\x1b[?1049h" in output
         assert b"Replux" in output
         if injected:
-            os.write(master, b"hello\r")
+            os.write(master, "中文问题".encode() + b"\n\x1b[200~  code()\n\tlast\n\n  \x1b[201~\r")
             if entry == "cancel":
                 read_until("你好".encode())
                 os.write(master, b"\x03")
