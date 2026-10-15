@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Self, cast
 
-from anthropic import APIError, AsyncAnthropic, DefaultAsyncHttpxClient
+from anthropic import APIError, APIStatusError, AsyncAnthropic, DefaultAsyncHttpxClient, omit
 from anthropic.types import ContentBlock, MessageParam
 import httpx2 as httpx
 import openai
@@ -22,13 +22,18 @@ class TextDelta:
 
 
 @dataclass(frozen=True)
+class ThinkingDelta:
+    text: str
+
+
+@dataclass(frozen=True)
 class ReplyCompleted:
     stop_reason: str
     input_tokens: int | None
     output_tokens: int | None
 
 
-StreamEvent = TextDelta | ReplyCompleted
+StreamEvent = TextDelta | ThinkingDelta | ReplyCompleted
 
 
 class LLMError(RuntimeError):
@@ -91,6 +96,7 @@ class AnthropicClient(LLMClient):
                 model=self._config.model,
                 max_tokens=self._config.max_output_tokens,
                 messages=[*self._history, user_message],
+                thinking=self._config.thinking if self._config.thinking is not None else omit,
                 stream=True,
             ) as stream:
                 async for event in stream:
@@ -103,6 +109,7 @@ class AnthropicClient(LLMClient):
                         elif event.delta.type == "thinking_delta":
                             assert block.type == "thinking"
                             block.thinking += event.delta.thinking
+                            yield ThinkingDelta(event.delta.thinking)
                         elif event.delta.type == "signature_delta":
                             assert block.type == "thinking"
                             block.signature = event.delta.signature
@@ -139,6 +146,8 @@ class AnthropicClient(LLMClient):
             yield ReplyCompleted(stop_reason, input_tokens, output_tokens)
         except (APIError, httpx.HTTPError) as error:
             # Keep the cause for callers, but never display a server's error body.
+            if isinstance(error, APIStatusError) and error.status_code == 400 and self._config.thinking is not None:
+                raise LLMError("模型拒绝请求，请检查 thinking 配置及其他请求参数。") from error
             raise LLMError("模型请求失败，请检查连接配置或服务状态。") from error
         finally:
             self._active = False

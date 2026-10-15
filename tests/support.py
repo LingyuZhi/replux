@@ -91,6 +91,31 @@ def responses_events(*, refusal: bool = False) -> list[dict[str, Any]]:
     return events
 
 
+def thinking_events(
+    chunks: tuple[str, ...] = ("先分析\n", "再回答"), *, redacted_only: bool = False,
+) -> list[dict[str, Any]]:
+    events = reply_events()
+    text_index = 1 if redacted_only else 2
+    for event in events:
+        if "index" in event:
+            event["index"] = text_index
+    thinking = [] if redacted_only else [
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+        *[
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": chunk}}
+            for chunk in chunks
+        ],
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "opaque-signature+/="}},
+        {"type": "content_block_stop", "index": 0},
+    ]
+    events[1:1] = [
+        *thinking,
+        {"type": "content_block_start", "index": text_index - 1, "content_block": {"type": "redacted_thinking", "data": "opaque-redacted+/="}},
+        {"type": "content_block_stop", "index": text_index - 1},
+    ]
+    return events
+
+
 def unfinished_events(protocol: str, ending: str) -> list[dict[str, Any]]:
     events = reply_events(protocol)
     if ending == "eof":

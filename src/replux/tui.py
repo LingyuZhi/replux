@@ -6,9 +6,9 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.worker import WorkerCancelled
-from textual.widgets import Header, Input, Static
+from textual.widgets import Collapsible, Header, Input, Static
 
-from replux.llm import IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, TextDelta
+from replux.llm import IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, TextDelta, ThinkingDelta
 
 
 class RepluxApp(App[None]):
@@ -20,6 +20,7 @@ class RepluxApp(App[None]):
     #transcript { height: 1fr; padding: 1 2; }
     .user { margin-top: 1; color: $accent; }
     .reply { margin: 1 0; }
+    .thinking-content { color: $text-muted; }
     .turn-status { color: $warning; }
     """
 
@@ -51,12 +52,30 @@ class RepluxApp(App[None]):
         reply = Static("", classes="reply", markup=False)
         await transcript.mount(Static(user_input, classes="user", markup=False), reply)
         text = ""
+        thinking_text = ""
+        thinking: Static | None = None
         try:
             async with aclosing(self._client.stream_reply(user_input)) as events:
                 async for event in events:
                     if isinstance(event, TextDelta):
                         text += event.text
                         reply.update(text)
+                        transcript.scroll_end(animate=False)
+                    elif isinstance(event, ThinkingDelta) and event.text:
+                        thinking_text += event.text
+                        if thinking is None:
+                            if not thinking_text.strip():
+                                continue
+                            thinking = Static(thinking_text, classes="thinking-content", markup=False)
+                            await transcript.mount(
+                                Collapsible(
+                                    thinking, title="思考", collapsed=True,
+                                    collapsed_symbol="+", expanded_symbol="-", classes="thinking",
+                                ),
+                                before=reply,
+                            )
+                        else:
+                            thinking.update(thinking_text)
                         transcript.scroll_end(animate=False)
                     elif isinstance(event, ReplyCompleted):
                         self.query_one("#status", Static).update("就绪")

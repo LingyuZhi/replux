@@ -21,6 +21,24 @@ max_output_tokens: 8192
 timeout_seconds: 120
 ```
 
+Anthropic 可按模型支持情况添加 `thinking`。省略时保持模型默认行为。
+例如，显式使用 adaptive 并请求可展示摘要：
+
+```yaml
+thinking:
+  type: adaptive
+  display: summarized
+```
+
+手动模式可写为 `thinking: {type: enabled, budget_tokens: 1024}`。
+预算必须至少为 `1024`，且小于 `max_output_tokens`；也可添加 `display: summarized`。
+显式关闭使用 `thinking: {type: disabled}`，不能携带预算或展示参数。
+模型拒绝配置时会报错，不自动更换模式或重试。
+
+API 返回可展示思考内容后，每轮显示默认折叠的 `+ 思考`。
+点击 `+` 展开、点击 `-` 收起；用 `Tab` 移动焦点后，也可按 `Enter` 切换。
+展开后继续显示新增内容。显示操作不改变请求；没有可展示内容时不出现控件。
+
 使用 OpenAI Responses 时，将配置改为：
 
 ```yaml
@@ -41,7 +59,7 @@ uv run python -m replux --config /path/to/config.yaml
 
 每次启动仅读取一份配置，修改后需重启。`api_key` 按字面读取；
 `base_url` 直接交给 SDK，兼容端点需填写其要求的根地址。
-最后两个字段可省略。`timeout_seconds` 控制网络 I/O 等待时间。
+`max_output_tokens` 和 `timeout_seconds` 可省略。`timeout_seconds` 控制网络 I/O 等待时间。
 请求自动重试已关闭。
 
 在底部输入问题，按 `Enter` 发送。空闲时按 `Ctrl+C` 退出。

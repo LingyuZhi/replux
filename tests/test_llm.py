@@ -6,11 +6,48 @@ from typing import Any
 
 import pytest
 from anthropic import APIStatusError, APITimeoutError
+from anthropic.types import ThinkingConfigParam
 import httpx2 as httpx
 import openai
 
 from replux.llm import AnthropicClient, LLMClient, LLMError, OpenAIClient, ReplyCompleted, TextDelta, create_client
 from tests.support import ControlledSSE, RecordingTransport, provider_config, reply_events
+
+
+@pytest.mark.parametrize(
+    "thinking",
+    [
+        {"type": "adaptive", "display": "summarized"},
+        {"type": "enabled", "budget_tokens": 1024, "display": "summarized"},
+        {"type": "disabled"},
+    ],
+)
+async def test_rejected_thinking_configuration_is_reported_without_fallback(
+    thinking: ThinkingConfigParam,
+) -> None:
+    requests = []
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(400, json={"error": {
+            "type": "invalid_request_error",
+            "message": "thinking is unsupported for this model; test-secret-never-display",
+        }})
+
+    config = replace(provider_config(), thinking=thinking)
+    async with create_client(config, transport=httpx.MockTransport(reject)) as client:
+        with pytest.raises(LLMError, match="thinking") as caught:
+            await anext(client.stream_reply("hello"))
+
+    assert isinstance(caught.value.__cause__, APIStatusError)
+    assert caught.value.__cause__.status_code == 400
+    assert "test-secret-never-display" not in str(caught.value)
+    assert len(requests) == 1
+    request = json.loads(requests[0].content)
+    assert request["thinking"] == thinking
+    assert request["max_tokens"] == 8192
+    assert request["model"] == "custom-model-20261001"
+    assert requests[0].headers["x-stainless-retry-count"] == "0"
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])

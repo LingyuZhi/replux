@@ -1,10 +1,13 @@
 from pathlib import Path
+import json
 import traceback
+from typing import Any
 
 import pytest
 
 from replux.cli import create_app
 from replux.config import ConfigError, load_config
+from replux.llm import ReplyCompleted, create_client
 from tests.support import ControlledSSE, RecordingTransport
 
 
@@ -14,6 +17,38 @@ VALID_YAML = (
     "base_url: https://gateway.example/anthropic/v2\n"
     "api_key: test-secret-never-display\n"
 )
+
+
+@pytest.mark.parametrize(
+    ("thinking", "expected"),
+    [
+        ("", None),
+        ("{type: adaptive}", {"type": "adaptive"}),
+        ("{type: adaptive, display: summarized}", {"type": "adaptive", "display": "summarized"}),
+        ("{type: enabled, budget_tokens: 1024}", {"type": "enabled", "budget_tokens": 1024}),
+        ("{type: enabled, budget_tokens: 8191, display: summarized}", {"type": "enabled", "budget_tokens": 8191, "display": "summarized"}),
+        ("{type: disabled}", {"type": "disabled"}),
+    ],
+)
+async def test_thinking_configuration_reaches_request_without_changes(
+    tmp_path: Path, thinking: str, expected: dict[str, Any] | None,
+) -> None:
+    path = tmp_path / "provider.yaml"
+    path.write_text(VALID_YAML + (f"thinking: {thinking}\n" if thinking else ""), encoding="utf-8")
+    transport = RecordingTransport(ControlledSSE())
+
+    async with create_client(load_config(path), transport=transport) as client:
+        received = [event async for event in client.stream_reply("hello")]
+
+    assert received[-1] == ReplyCompleted("end_turn", 11, 5)
+    assert len(transport.requests) == 1
+    request = json.loads(transport.requests[0].content)
+    assert request["model"] == "custom-model-20261001"
+    assert request["max_tokens"] == 8192
+    if expected is None:
+        assert "thinking" not in request
+    else:
+        assert request["thinking"] == expected
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
@@ -84,6 +119,29 @@ def test_config_preserves_connection_values_and_sets_defaults(tmp_path: Path, pr
         VALID_YAML.replace("https://gateway.example/anthropic/v2", "https://[broken"),
         VALID_YAML + "? [test-secret-never-display]\n: value\n",
         VALID_YAML + "thinking: {type: enabled}\n",
+        *[
+            VALID_YAML + f"thinking: {thinking}\n"
+            for thinking in (
+                "null", "false", "[]", "enabled", "{}",
+                "{type: null}", "{type: []}", "{type: test-secret-never-display}",
+                "{type: adaptive, test-secret-never-display: unknown}",
+                "{type: adaptive, type: disabled}",
+                "{type: adaptive, budget_tokens: 0}",
+                "{type: adaptive, budget_tokens: null}",
+                "{type: disabled, budget_tokens: 1024}",
+                "{type: disabled, budget_tokens: null}",
+                "{type: disabled, display: summarized}",
+                "{type: disabled, display: null}",
+                "{type: adaptive, display: omitted}",
+                "{type: adaptive, display: null}",
+                "{type: enabled, budget_tokens: 1024, display: []}",
+                *[
+                    f"{{type: enabled, budget_tokens: {budget}}}"
+                    for budget in ("null", "true", "'1024'", "1024.0", "-1", "0", "1023", "8192", "8193")
+                ],
+            )
+        ],
+        VALID_YAML + "max_output_tokens: 1024\nthinking: {type: enabled, budget_tokens: 1024}\n",
     ],
 )
 def test_invalid_config_fails_without_echoing_values(

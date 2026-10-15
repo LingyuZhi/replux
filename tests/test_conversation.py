@@ -5,8 +5,8 @@ from typing import Any
 import pytest
 import httpx2 as httpx
 
-from replux.llm import IncompleteReplyError, LLMError, ReplyCompleted, StreamEvent, TextDelta, create_client
-from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events, unfinished_events
+from replux.llm import IncompleteReplyError, LLMError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta, create_client
+from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events, thinking_events, unfinished_events
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
@@ -120,19 +120,7 @@ async def test_unfinished_turn_preserves_previously_completed_history(protocol: 
 
 
 async def test_anthropic_replays_native_thinking_signature_redacted_and_citations() -> None:
-    events = reply_events()
-    for event in events:
-        if "index" in event:
-            event["index"] = 2
-    events[1:1] = [
-        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
-        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "先分析\n"}},
-        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "再回答"}},
-        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "opaque-signature+/="}},
-        {"type": "content_block_stop", "index": 0},
-        {"type": "content_block_start", "index": 1, "content_block": {"type": "redacted_thinking", "data": "opaque-redacted+/="}},
-        {"type": "content_block_stop", "index": 1},
-    ]
+    events = thinking_events()
     citation = {
         "type": "char_location", "cited_text": "世界", "document_index": 0,
         "document_title": "Reference", "start_char_index": 0, "end_char_index": 2,
@@ -142,7 +130,10 @@ async def test_anthropic_replays_native_thinking_signature_redacted_and_citation
     transport = RecordingTransport(streams)
     async with create_client(provider_config(), transport=transport) as client:
         received = [event async for event in client.stream_reply("first")]
-        assert received == [TextDelta("你好"), TextDelta("，世界\n"), ReplyCompleted("end_turn", 11, 5)]
+        assert received == [
+            ThinkingDelta("先分析\n"), ThinkingDelta("再回答"),
+            TextDelta("你好"), TextDelta("，世界\n"), ReplyCompleted("end_turn", 11, 5),
+        ]
         _ = [event async for event in client.stream_reply("follow-up")]
     assert json.loads(transport.requests[1].content)["messages"] == [
         {"role": "user", "content": "first"},

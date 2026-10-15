@@ -5,13 +5,198 @@ from pathlib import Path
 
 import pytest
 import httpx2 as httpx
-from textual.widgets import Input, Static
+from textual.widgets import Collapsible, Input, Static
 
 from replux.cli import create_app
-from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta
+from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta
 from replux.tui import RepluxApp
-from tests.support import ControlledSSE, RecordingTransport, native_reply, reply_events, unfinished_events
+from tests.support import ControlledSSE, RecordingTransport, native_reply, reply_events, thinking_events, unfinished_events
 from tests.test_config import VALID_YAML
+
+
+@pytest.mark.parametrize("empty_text", ["", " \n"], ids=["empty", "whitespace"])
+async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_each_turn(empty_text: str) -> None:
+    class ScriptedClient(LLMClient):
+        def __init__(self) -> None:
+            self.inputs: list[str] = []
+            self.reached = [asyncio.Event() for _ in range(3)]
+            self.release = [asyncio.Event() for _ in range(3)]
+            self.closed = False
+
+        async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
+            self.inputs.append(user_input)
+            for index, text in enumerate([empty_text, "[bold]先分析[/bold]\n", "再回答"]):
+                yield ThinkingDelta(text)
+                self.reached[index].set()
+                await self.release[index].wait()
+            yield TextDelta("正文正常显示")
+            yield ReplyCompleted("end_turn", 11, 5)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    client = ScriptedClient()
+    app = RepluxApp(client)
+    async with app.run_test(size=(80, 24)) as pilot:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = "first"
+        await pilot.press("enter")
+        await asyncio.wait_for(client.reached[0].wait(), timeout=2)
+        assert not app.query(Collapsible)
+
+        client.release[0].set()
+        await asyncio.wait_for(client.reached[1].wait(), timeout=2)
+        await pilot.pause()
+        thinking = app.query_one(Collapsible)
+        title = thinking.query_one("CollapsibleTitle", Static)
+        assert thinking.collapsed
+        assert str(title.content) == "+ 思考"
+        assert "先分析" not in app.export_screenshot()
+        prompt.value = "next draft"
+
+        await pilot.click(title, offset=(1, 0))
+        assert not thinking.collapsed
+        assert str(title.content) == "- 思考"
+        assert "[bold]先分析[/bold]" in app.export_screenshot()
+        client.release[1].set()
+        await asyncio.wait_for(client.reached[2].wait(), timeout=2)
+        await pilot.pause()
+        assert "再回答" in app.export_screenshot()
+        assert app.query_one("#status", Static).content == "生成中…"
+        assert not thinking.collapsed
+
+        await pilot.click(title, offset=(1, 0))
+        assert thinking.collapsed
+        assert "先分析" not in app.export_screenshot()
+        prompt.focus()
+        await pilot.press("shift+tab")
+        assert app.focused is title
+        await pilot.press("enter")
+        assert not thinking.collapsed
+        assert "再回答" in app.export_screenshot()
+        assert client.inputs == ["first"]
+        assert prompt.value == "next draft"
+
+        client.release[2].set()
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert app.query_one(".reply", Static).content == "正文正常显示"
+        await pilot.press("enter")
+        assert thinking.collapsed
+        assert client.inputs == ["first"]
+        assert prompt.value == "next draft"
+        await pilot.press("enter")
+        prompt.focus()
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        regions = list(app.query(Collapsible))
+        assert len(regions) == 2
+        assert not regions[0].collapsed
+        assert regions[1].collapsed
+        assert client.inputs == ["first", "next draft"]
+    assert client.closed
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["model-default", "summarized"])
+async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_intact(
+    tmp_path: Path, configured: bool,
+) -> None:
+    path = tmp_path / "provider.yaml"
+    path.write_text(
+        VALID_YAML + ("thinking: {type: adaptive, display: summarized}\n" if configured else ""),
+        encoding="utf-8",
+    )
+    stream = ControlledSSE(thinking_events(), gate_after=2)
+    transport = RecordingTransport([stream, ControlledSSE()])
+    app = create_app(["--config", str(path)], transport=transport)
+
+    async with app.run_test(size=(80, 24)) as pilot:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = "first"
+        await pilot.press("enter")
+        await asyncio.wait_for(stream.blocked.wait(), timeout=2)
+        await pilot.pause()
+        thinking = app.query_one(Collapsible)
+        title = thinking.query_one("CollapsibleTitle", Static)
+        assert thinking.collapsed
+        assert "先分析" not in app.export_screenshot()
+        assert app.query_one(".reply", Static).content == ""
+        first_request = json.loads(transport.requests[0].content)
+        if configured:
+            assert first_request["thinking"] == {"type": "adaptive", "display": "summarized"}
+        else:
+            assert "thinking" not in first_request
+
+        await pilot.click(title, offset=(1, 0))
+        assert "先分析" in app.export_screenshot()
+        stream.release_close.clear()
+        stream.release.set()
+        try:
+            await asyncio.wait_for(stream.closing.wait(), timeout=2)
+            await pilot.pause()
+            assert "再回答" in app.export_screenshot()
+            assert "opaque-" not in app.export_screenshot()
+            assert app.query_one(".thinking-content", Static).content == "先分析\n再回答"
+            assert app.query_one(".reply", Static).content == "你好，世界\n"
+            assert app.query_one("#status", Static).content == "生成中…"
+            assert not stream.closed
+            await pilot.click(title, offset=(1, 0))
+            assert "先分析" not in app.export_screenshot()
+            assert "你好，世界" in app.export_screenshot()
+            title.focus()
+            await pilot.press("enter")
+            assert not thinking.collapsed
+            assert len(transport.requests) == 1
+        finally:
+            stream.release_close.set()
+
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        prompt.focus()
+        prompt.value = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert app.query_one("#status", Static).content == "就绪"
+
+    assert len(transport.requests) == 2
+    second_request = json.loads(transport.requests[1].content)
+    assert {key: value for key, value in second_request.items() if key != "messages"} == {
+        key: value for key, value in first_request.items() if key != "messages"
+    }
+    assert second_request["messages"] == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "先分析\n再回答", "signature": "opaque-signature+/="},
+            {"type": "redacted_thinking", "data": "opaque-redacted+/="},
+            {"type": "text", "text": "你好，世界\n"},
+        ]},
+        {"role": "user", "content": "follow-up"},
+    ]
+    assert stream.closed
+    assert transport.closed
+
+
+@pytest.mark.parametrize("content", ["none", "empty", "redacted-only"])
+async def test_no_thinking_control_without_displayable_api_text(tmp_path: Path, content: str) -> None:
+    path = tmp_path / "provider.yaml"
+    path.write_text(VALID_YAML + "thinking: {type: adaptive, display: summarized}\n", encoding="utf-8")
+    events = reply_events() if content == "none" else thinking_events(("",), redacted_only=content == "redacted-only")
+    stream = ControlledSSE(events, gate_after=len(events) - 2)
+    transport = RecordingTransport(stream)
+    app = create_app(["--config", str(path)], transport=transport)
+
+    async with app.run_test() as pilot:
+        app.query_one("#prompt", Input).value = "hello"
+        await pilot.press("enter")
+        await asyncio.wait_for(stream.blocked.wait(), timeout=2)
+        await pilot.pause()
+        assert not app.query(Collapsible)
+        assert app.query_one(".reply", Static).content == "你好，世界\n"
+        assert "opaque-" not in app.export_screenshot()
+        stream.release.set()
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert not app.query(Collapsible)
+    assert len(transport.requests) == 1
+    assert stream.closed
+    assert transport.closed
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])

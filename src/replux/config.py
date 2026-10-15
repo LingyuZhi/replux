@@ -4,8 +4,10 @@ from collections.abc import Hashable
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
+from typing import cast
 from urllib.parse import urlsplit
 
+from anthropic.types import ThinkingConfigParam
 import yaml
 
 
@@ -42,6 +44,7 @@ class ProviderConfig:
     api_key: str = field(repr=False)
     max_output_tokens: int = 8192
     timeout_seconds: float = 120
+    thinking: ThinkingConfigParam | None = None
 
 
 def load_config(path: Path | None = None) -> ProviderConfig:
@@ -61,9 +64,9 @@ def load_config(path: Path | None = None) -> ProviderConfig:
         raise ConfigError("配置必须是 YAML 字段映射。")
     if values.get("protocol") == "openai" and "thinking" in values:
         raise ConfigError("OpenAI 配置不支持 Anthropic 专用的 thinking 字段。")
-    allowed = {"protocol", "model", "base_url", "api_key", "max_output_tokens", "timeout_seconds"}
+    allowed = {"protocol", "model", "base_url", "api_key", "max_output_tokens", "timeout_seconds", "thinking"}
     if values.keys() - allowed:
-        raise ConfigError("配置含未知字段；支持 protocol、model、base_url、api_key、max_output_tokens、timeout_seconds。")
+        raise ConfigError("配置含未知字段；支持 protocol、model、base_url、api_key、max_output_tokens、timeout_seconds、thinking。")
 
     protocol = _required_string(values, "protocol")
     if protocol not in {"anthropic", "openai"}:
@@ -102,7 +105,30 @@ def load_config(path: Path | None = None) -> ProviderConfig:
     if not math.isfinite(timeout) or timeout <= 0:
         raise ConfigError("timeout_seconds 必须是有限正数。")
 
-    return ProviderConfig(protocol, model, base_url, api_key, max_tokens, timeout)
+    thinking = _thinking_config(values["thinking"], max_tokens) if "thinking" in values else None
+    return ProviderConfig(protocol, model, base_url, api_key, max_tokens, timeout, thinking)
+
+
+def _thinking_config(value: object, max_tokens: int) -> ThinkingConfigParam:
+    if not isinstance(value, dict):
+        raise ConfigError("thinking 必须是包含 type 的字段映射。")
+    if value.keys() - {"type", "budget_tokens", "display"}:
+        raise ConfigError("thinking 含未知字段；仅支持 type、budget_tokens、display。")
+    mode = value.get("type")
+    if not isinstance(mode, str) or mode not in {"enabled", "adaptive", "disabled"}:
+        raise ConfigError("thinking.type 仅支持 enabled、adaptive 或 disabled。")
+    if mode == "enabled":
+        budget = value.get("budget_tokens")
+        if type(budget) is not int or not 1024 <= budget < max_tokens:
+            raise ConfigError("thinking.budget_tokens 必须是至少 1024 且小于 max_output_tokens 的整数。")
+    elif "budget_tokens" in value:
+        raise ConfigError("只有 enabled 模式可以设置 thinking.budget_tokens。")
+    if "display" in value:
+        if mode == "disabled":
+            raise ConfigError("disabled 模式不能设置 thinking.display。")
+        if value["display"] != "summarized":
+            raise ConfigError("thinking.display 仅支持 summarized。")
+    return cast(ThinkingConfigParam, value)
 
 
 def _required_string(values: dict[str, object], name: str) -> str:
