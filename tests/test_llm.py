@@ -9,18 +9,8 @@ from anthropic import APIStatusError, APITimeoutError
 import httpx2 as httpx
 import openai
 
-from replux.config import ProviderConfig
 from replux.llm import AnthropicClient, LLMClient, LLMError, OpenAIClient, ReplyCompleted, TextDelta, create_client
-from tests.support import ControlledSSE, RecordingTransport, reply_events
-
-
-def provider_config(protocol: str = "anthropic") -> ProviderConfig:
-    return ProviderConfig(
-        protocol=protocol,
-        model="custom-model-20261001",
-        base_url="https://gateway.example/anthropic/v2",
-        api_key="${LITERAL_KEY}",
-    )
+from tests.support import ControlledSSE, RecordingTransport, provider_config, reply_events
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
@@ -219,7 +209,7 @@ async def test_openai_requires_a_completed_supported_response(failure: str) -> N
     assert transport.closed
 
 
-async def test_openai_reasoning_items_do_not_appear_in_reply_text() -> None:
+async def test_openai_replays_complete_output_without_displaying_reasoning() -> None:
     events = reply_events("openai")
     summary = {"type": "summary_text", "text": "offline reasoning summary"}
     reasoning = {
@@ -231,6 +221,7 @@ async def test_openai_reasoning_items_do_not_appear_in_reply_text() -> None:
         if "output_index" in event:
             event["output_index"] += 1
     events[-1]["response"]["output"].insert(0, reasoning)
+    events[-1]["response"]["output"][1]["phase"] = "final_answer"
     events[2:2] = [
         {"type": "response.output_item.added", "output_index": 0, "item": {**reasoning, "status": "in_progress", "summary": [], "encrypted_content": None}},
         {"type": "response.reasoning_summary_part.added", **position, "part": {**summary, "text": ""}},
@@ -242,11 +233,22 @@ async def test_openai_reasoning_items_do_not_appear_in_reply_text() -> None:
     for number, event in enumerate(events):
         event["sequence_number"] = number
     stream = ControlledSSE(events)
-    transport = RecordingTransport(stream)
+    follow_up = ControlledSSE(reply_events("openai"))
+    transport = RecordingTransport([stream, follow_up])
     async with create_client(provider_config("openai"), transport=transport) as client:
         received = [event async for event in client.stream_reply("hello")]
+        _ = [event async for event in client.stream_reply("follow-up")]
     assert received == [TextDelta("你好"), TextDelta("，世界\n"), ReplyCompleted("completed", 11, 5)]
+    request = json.loads(transport.requests[1].content)
+    assert request["input"] == [
+        {"role": "user", "content": "hello"},
+        *events[-1]["response"]["output"],
+        {"role": "user", "content": "follow-up"},
+    ]
+    assert set(request) == {"model", "input", "max_output_tokens", "stream", "store"}
+    assert request["store"] is False
     assert stream.closed
+    assert follow_up.closed
     assert transport.closed
 
 

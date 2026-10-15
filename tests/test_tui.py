@@ -10,7 +10,7 @@ from textual.widgets import Input, Static
 from replux.cli import create_app
 from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta
 from replux.tui import RepluxApp
-from tests.support import ControlledSSE, RecordingTransport, reply_events
+from tests.support import ControlledSSE, RecordingTransport, native_reply, reply_events, unfinished_events
 from tests.test_config import VALID_YAML
 
 
@@ -186,3 +186,66 @@ async def test_exit_waits_for_in_progress_stream_cleanup(tmp_path: Path, protoco
         await asyncio.wait_for(exiting, timeout=2)
     assert stream.closed
     assert transport.closed
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+@pytest.mark.parametrize("ending", ["eof", "content_end", "output_limit", "incomplete"])
+async def test_incomplete_turn_stays_visible_and_out_of_next_request(
+    tmp_path: Path, protocol: str, ending: str,
+) -> None:
+    config = tmp_path / "provider.yaml"
+    config.write_text(VALID_YAML.replace("protocol: anthropic", f"protocol: {protocol}"), encoding="utf-8")
+    incomplete = ControlledSSE(unfinished_events(protocol, ending))
+    transport = RecordingTransport([
+        ControlledSSE(reply_events(protocol)), incomplete, ControlledSSE(reply_events(protocol)),
+    ])
+    app = create_app(["--config", str(config)], transport=transport)
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", Input)
+        for user_input in ["first", "unfinished"]:
+            prompt.value = user_input
+            await pilot.press("enter")
+            await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert incomplete.closed
+        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好，世界\n"]
+        assert "未完成" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "就绪"
+        prompt.value = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert len(app.query(".reply")) == 3
+        assert "未完成" in str(app.query_one(".turn-status", Static).content)
+        assert [user.content for user in app.query(".user").results(Static)] == ["first", "unfinished", "follow-up"]
+    field = "messages" if protocol == "anthropic" else "input"
+    assert len(transport.requests) == 3
+    assert json.loads(transport.requests[2].content)[field] == [
+        {"role": "user", "content": "first"}, *native_reply(protocol),
+        {"role": "user", "content": "follow-up"},
+    ]
+    assert transport.closed
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_recreated_app_starts_with_empty_conversation(tmp_path: Path, protocol: str) -> None:
+    config = tmp_path / "provider.yaml"
+    config.write_text(VALID_YAML.replace("protocol: anthropic", f"protocol: {protocol}"), encoding="utf-8")
+    field = "messages" if protocol == "anthropic" else "input"
+    for questions in [["remember this", "follow-up"], ["new conversation"]]:
+        streams = [ControlledSSE(reply_events(protocol)) for _ in questions]
+        transport = RecordingTransport(streams)
+        app = create_app(["--config", str(config)], transport=transport)
+        async with app.run_test() as pilot:
+            assert not app.query(".user, .reply")
+            expected = []
+            for question in questions:
+                app.query_one("#prompt", Input).value = question
+                await pilot.press("enter")
+                await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+                expected.append({"role": "user", "content": question})
+                assert json.loads(transport.requests[-1].content)[field] == expected
+                expected.extend(native_reply(protocol))
+            assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n"] * len(questions)
+            await pilot.press("ctrl+c")
+        assert len(transport.requests) == len(questions)
+        assert all(stream.closed for stream in streams)
+        assert transport.closed

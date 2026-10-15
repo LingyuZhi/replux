@@ -8,7 +8,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.worker import WorkerCancelled
 from textual.widgets import Header, Input, Static
 
-from replux.llm import LLMClient, LLMError, ReplyCompleted, TextDelta
+from replux.llm import IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, TextDelta
 
 
 class RepluxApp(App[None]):
@@ -20,6 +20,7 @@ class RepluxApp(App[None]):
     #transcript { height: 1fr; padding: 1 2; }
     .user { margin-top: 1; color: $accent; }
     .reply { margin: 1 0; }
+    .turn-status { color: $warning; }
     """
 
     def __init__(self, client: LLMClient) -> None:
@@ -59,6 +60,10 @@ class RepluxApp(App[None]):
                         transcript.scroll_end(animate=False)
                     elif isinstance(event, ReplyCompleted):
                         self.query_one("#status", Static).update("就绪")
+        except IncompleteReplyError as error:
+            await transcript.mount(Static(str(error), classes="turn-status", markup=False))
+            transcript.scroll_end(animate=False)
+            self.query_one("#status", Static).update("就绪")
         except LLMError as error:
             self.exit(message=str(error), return_code=1)
         self._generating = False

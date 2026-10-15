@@ -7,6 +7,24 @@ from typing import Any
 
 import httpx2 as httpx
 
+from replux.config import ProviderConfig
+
+
+def provider_config(protocol: str = "anthropic") -> ProviderConfig:
+    return ProviderConfig(
+        protocol=protocol,
+        model="custom-model-20261001",
+        base_url="https://gateway.example/anthropic/v2",
+        api_key="${LITERAL_KEY}",
+    )
+
+
+def native_reply(protocol: str, *, refusal: bool = False) -> list[dict[str, Any]]:
+    if protocol == "openai":
+        return list(reply_events(protocol, refusal=refusal)[-1]["response"]["output"])
+    text = "抱歉，无法回答。\n" if refusal else "你好，世界\n"
+    return [{"role": "assistant", "content": [{"type": "text", "text": text}]}]
+
 
 def reply_events(protocol: str = "anthropic", *, refusal: bool = False) -> list[dict[str, Any]]:
     if protocol == "openai":
@@ -73,15 +91,50 @@ def responses_events(*, refusal: bool = False) -> list[dict[str, Any]]:
     return events
 
 
+def unfinished_events(protocol: str, ending: str) -> list[dict[str, Any]]:
+    events = reply_events(protocol)
+    if ending == "eof":
+        return events[:-1]
+    if ending == "content_end":
+        return events[:5] if protocol == "anthropic" else events[:8]
+    if protocol == "anthropic":
+        reasons = {"output_limit": "max_tokens", "incomplete": "pause_turn", "tool_request": "tool_use", "tool_terminal": "tool_use"}
+        events[-2]["delta"]["stop_reason"] = reasons[ending]
+        if ending == "tool_request":
+            events[-2:-2] = [
+                {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "tool_offline", "name": "unavailable", "input": {}}},
+                {"type": "content_block_stop", "index": 1},
+            ]
+    elif ending in {"tool_request", "tool_terminal"}:
+        tool = {"id": "fc_offline", "type": "function_call", "call_id": "call_offline", "name": "unavailable", "arguments": "{}", "status": "completed"}
+        events[-1]["response"]["output"].append(tool)
+        if ending == "tool_request":
+            events[-1:-1] = [
+                {"type": "response.output_item.added", "output_index": 1, "item": {**tool, "status": "in_progress", "arguments": ""}},
+                {"type": "response.output_item.done", "output_index": 1, "item": tool},
+            ]
+    else:
+        reasons = {"output_limit": "max_output_tokens", "incomplete": "content_filter"}
+        events[-1]["type"] = "response.incomplete"
+        events[-1]["response"]["status"] = "incomplete"
+        events[-1]["response"]["incomplete_details"] = {"reason": reasons[ending]}
+    if protocol == "openai":
+        for number, event in enumerate(events):
+            event["sequence_number"] = number
+    return events
+
+
 class ControlledSSE(httpx.AsyncByteStream):
     def __init__(
         self,
         events: list[dict[str, Any]] | None = None,
         *,
         gate_after: int | None = None,
+        close_error: Exception | None = None,
     ) -> None:
         self.events = reply_events() if events is None else events
         self.gate_after = gate_after
+        self.close_error = close_error
         self.blocked = asyncio.Event()
         self.release = asyncio.Event()
         self.closing = asyncio.Event()
@@ -100,19 +153,22 @@ class ControlledSSE(httpx.AsyncByteStream):
         self.closing.set()
         await self.release_close.wait()
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 class RecordingTransport(httpx.MockTransport):
-    def __init__(self, stream: ControlledSSE, status_code: int = 200) -> None:
+    def __init__(self, stream: ControlledSSE | list[ControlledSSE], status_code: int = 200) -> None:
         self.requests: list[httpx.Request] = []
         self.closed = False
+        streams = iter(stream if isinstance(stream, list) else [stream])
 
         def respond(request: httpx.Request) -> httpx.Response:
             self.requests.append(request)
             return httpx.Response(
                 status_code,
                 headers={"content-type": "text/event-stream"},
-                stream=stream,
+                stream=next(streams),
             )
 
         super().__init__(respond)

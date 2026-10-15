@@ -1,7 +1,7 @@
 # Replux
 
-Replux 是一个终端 AI 助手。支持通过 Anthropic Messages 或 OpenAI Responses 完成单轮流式问答。
-每次提问独立发送，回复正文会随生成过程显示。
+Replux 是一个终端 AI 助手。支持通过 Anthropic Messages 或 OpenAI Responses 完成多轮流式问答。
+回复正文会随生成过程显示。后续提问会携带此前完整成功的交流，退出后不保存对话。
 
 需要 Python 3.11+ 和 [uv](https://docs.astral.sh/uv/)。
 
@@ -45,7 +45,8 @@ uv run python -m replux --config /path/to/config.yaml
 请求自动重试已关闭。
 
 在底部输入问题，按 `Enter` 发送。空闲时按 `Ctrl+C` 退出。
-请求失败会显示提示并退出。完整请求错误恢复将在后续版本加入。
+未完成或截断的回复会保留在界面并标记，不进入后续上下文；需要重发问题。
+网络或 API 请求失败仍会显示提示并退出。完整请求错误恢复将在后续版本加入。
 
 开发检查：
 
