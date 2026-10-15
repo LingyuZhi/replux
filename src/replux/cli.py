@@ -14,8 +14,8 @@ from replux.tui import RepluxApp
 def create_app(
     argv: Sequence[str] | None = None, *, transport: httpx.AsyncBaseTransport | None = None
 ) -> RepluxApp:
-    parser = argparse.ArgumentParser(prog="replux", description="Replux 终端 AI 助手")
-    parser.add_argument("--config", type=Path, help="配置文件（默认 ~/.replux/config.yaml）")
+    parser = argparse.ArgumentParser(prog="replux", description="Replux terminal AI assistant")
+    parser.add_argument("--config", type=Path, help="Configuration file (default: ~/.replux/config.yaml)")
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)

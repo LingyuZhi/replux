@@ -67,12 +67,12 @@ async def test_stream_error_codes_keep_their_category_and_actual_http_status(
 @pytest.mark.parametrize(
     "failure, error_type, hint",
     [
-        (401, AuthenticationError, "认证"),
-        (429, RateLimitError, "限流"),
-        (400, LLMError, "参数"),
-        (500, LLMError, "服务"),
-        ("connection", NetworkError, "连接"),
-        ("timeout", NetworkError, "超时"),
+        (401, AuthenticationError, "Authentication"),
+        (429, RateLimitError, "Rate limit"),
+        (400, LLMError, "parameters"),
+        (500, LLMError, "service"),
+        ("connection", NetworkError, "connection"),
+        ("timeout", NetworkError, "timed out"),
     ],
 )
 async def test_request_errors_keep_cause_and_status_without_retry_or_history_changes(
@@ -158,7 +158,7 @@ async def test_cancel_closes_stream_and_discards_late_events_and_unfinished_turn
             assert not consuming.done()
             assert not pending.closed
             assert received == expected
-            with pytest.raises(RuntimeError, match="进行"):
+            with pytest.raises(RuntimeError, match="in progress"):
                 await anext(client.stream_reply("too soon"))
             assert len(transport.requests) == 2
         finally:
@@ -221,14 +221,14 @@ async def test_partial_failure_keeps_visible_text_and_draft_then_uses_only_compl
         assert pending.closed
         assert app.is_running
         assert prompt.value == "follow-up"
-        assert app.query_one("#status", Static).content == "就绪"
-        assert "失败" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "Ready"
+        assert "Request failed" in str(app.query_one(".turn-status", Static).content)
         assert config.api_key not in app.export_screenshot()
         assert len(transport.requests) == 2
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好", "你好，世界\n"]
-        assert "失败" in str(app.query_one(".turn-status", Static).content)
+        assert "Request failed" in str(app.query_one(".turn-status", Static).content)
         await pilot.press("ctrl+c")
     field = "messages" if protocol == "anthropic" else "input"
     assert len(transport.requests) == 3
@@ -278,7 +278,7 @@ async def test_cancel_during_stream_cleanup_waits_before_releasing_client(protoc
             with pytest.raises(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(consuming), timeout=0.05)
             assert not pending.closed
-            with pytest.raises(RuntimeError, match="进行"):
+            with pytest.raises(RuntimeError, match="in progress"):
                 await anext(client.stream_reply("too soon"))
         finally:
             pending.release_close.set()

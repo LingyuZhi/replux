@@ -297,7 +297,7 @@ async def test_concurrent_reply_is_rejected_before_another_request(protocol: str
         async with aclosing(client.stream_reply("first")) as first:
             assert await anext(first) == TextDelta("你好")
             async with aclosing(client.stream_reply("second")) as second:
-                with pytest.raises(RuntimeError, match="进行"):
+                with pytest.raises(RuntimeError, match="in progress"):
                     await anext(second)
     assert stream.closed
     assert len(transport.requests) == 1

@@ -72,9 +72,9 @@ def _request_error(
 ) -> LLMError:
     status_code: int | None = getattr(error, "status_code", None)
     if isinstance(error, (APITimeoutError, openai.APITimeoutError, httpx.TimeoutException)):
-        return NetworkError("网络请求超时，请检查连接或稍后重试。", status_code=status_code)
+        return NetworkError("Network request timed out. Check your connection or try again later.", status_code=status_code)
     if isinstance(error, (APIConnectionError, openai.APIConnectionError, httpx.RequestError)):
-        return NetworkError("网络连接失败，请检查连接或稍后重试。", status_code=status_code)
+        return NetworkError("Network connection failed. Check your connection or try again later.", status_code=status_code)
     body = getattr(error, "body", None)
     details = body.get("error", body) if isinstance(body, dict) else None
     code = details.get("code") or details.get("type") if isinstance(details, dict) else None
@@ -92,16 +92,16 @@ def _response_error(
 ) -> LLMError:
     # Interpret known codes, but never display server bodies or invent HTTP status.
     if status_code == 401 or code in {"authentication_error", "invalid_api_key"}:
-        return AuthenticationError("认证失败，请检查 api_key。", status_code=status_code)
+        return AuthenticationError("Authentication failed. Check api_key.", status_code=status_code)
     if status_code == 429 or code in {"rate_limit_error", "rate_limit_exceeded"}:
-        return RateLimitError("请求被限流，请稍后手动重试。", status_code=status_code, retry_after=retry_after)
+        return RateLimitError("Rate limit reached. Try again later.", status_code=status_code, retry_after=retry_after)
     if status_code == 400:
         message = (
-            "模型拒绝请求，请检查 thinking 配置及其他请求参数。" if thinking
-            else "模型拒绝请求，请检查请求参数或对话上下文长度。"
+            "The model rejected the request. Check the thinking configuration and other request parameters." if thinking
+            else "The model rejected the request. Check the request parameters or conversation context length."
         )
         return LLMError(message, status_code=status_code)
-    return LLMError("模型请求失败，请检查连接配置或服务状态。", status_code=status_code)
+    return LLMError("Model request failed. Check your connection settings or the service status.", status_code=status_code)
 
 
 def _raise_if_cancelled() -> None:
@@ -182,7 +182,7 @@ class AnthropicClient(LLMClient):
 
     async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
         if self._active:
-            raise RuntimeError("已有进行中的回复。")
+            raise RuntimeError("A reply is already in progress.")
         self._active = True
         try:
             user_message: MessageParam = {"role": "user", "content": user_input}
@@ -224,7 +224,7 @@ class AnthropicClient(LLMClient):
                         input_tokens = getattr(usage, "input_tokens", None)
                     elif event.type == "content_block_start":
                         if event.content_block.type in {"tool_use", "server_tool_use"}:
-                            raise IncompleteReplyError("回复未完成：当前版本不支持工具请求。")
+                            raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
                         content.append(event.content_block)
                     elif event.type == "message_delta":
                         if event.delta.stop_reason is not None:
@@ -238,11 +238,11 @@ class AnthropicClient(LLMClient):
                         break
             _raise_if_cancelled()
             if not started or not stopped or stop_reason is None:
-                raise IncompleteReplyError("回复未完成：缺少完整的结束信号。")
+                raise IncompleteReplyError("Reply incomplete: the final completion signal is missing.")
             if stop_reason == "tool_use":
-                raise IncompleteReplyError("回复未完成：当前版本不支持工具请求。")
+                raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
             if stop_reason not in {"end_turn", "stop_sequence", "refusal"}:
-                raise IncompleteReplyError("回复未完成：输出达到上限，或返回了不支持的结束状态。")
+                raise IncompleteReplyError("Reply incomplete: the output limit was reached or the stop reason is not supported.")
             # No await between committing both sides of the turn and publishing success.
             self._history.extend([user_message, {"role": "assistant", "content": content}])
             yield ReplyCompleted(stop_reason, input_tokens, output_tokens)
@@ -275,7 +275,7 @@ class OpenAIClient(LLMClient):
 
     async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
         if self._active:
-            raise RuntimeError("已有进行中的回复。")
+            raise RuntimeError("A reply is already in progress.")
         self._active = True
         try:
             user_message: ResponseInputItemParam = {"role": "user", "content": user_input}
@@ -295,7 +295,7 @@ class OpenAIClient(LLMClient):
                         final = event.response
                         break
                     elif event.type == "response.incomplete":
-                        raise IncompleteReplyError("回复未完成：输出达到上限或响应被中断。")
+                        raise IncompleteReplyError("Reply incomplete: the output limit was reached or the response was interrupted.")
                     elif event.type in {"response.failed", "error"}:
                         code = event.code if event.type == "error" else (
                             event.response.error.code if event.response.error is not None else None
@@ -306,15 +306,15 @@ class OpenAIClient(LLMClient):
                         )
                     elif event.type in {"response.output_item.added", "response.output_item.done"}:
                         if event.item.type not in {"message", "reasoning"}:
-                            raise IncompleteReplyError("回复未完成：当前版本不支持工具请求。")
+                            raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
             _raise_if_cancelled()
             if final is None or final.status != "completed":
-                raise IncompleteReplyError("回复未完成：缺少完整的结束信号。")
+                raise IncompleteReplyError("Reply incomplete: the final completion signal is missing.")
             for item in final.output:
                 if item.type not in {"message", "reasoning"}:
-                    raise IncompleteReplyError("回复未完成：当前版本不支持工具请求。")
+                    raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
                 if item.type == "message" and item.status != "completed":
-                    raise IncompleteReplyError("回复未完成：正文尚未完成。")
+                    raise IncompleteReplyError("Reply incomplete: the reply text is unfinished.")
             usage = final.usage
             output = [cast(ResponseInputItemParam, item.to_dict()) for item in final.output]
             # Only replay output items; response metadata is not conversation input.

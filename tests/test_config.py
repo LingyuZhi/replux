@@ -170,7 +170,7 @@ def test_invalid_config_fails_without_echoing_values(
 
 
 def test_missing_config_reports_a_configuration_error(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="配置"):
+    with pytest.raises(ConfigError, match="configuration file"):
         load_config(tmp_path / "missing.yaml")
     transport = RecordingTransport(ControlledSSE())
     with pytest.raises(SystemExit) as exit_error:

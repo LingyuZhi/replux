@@ -53,19 +53,19 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
         thinking = app.query_one(Collapsible)
         title = thinking.query_one("CollapsibleTitle", Static)
         assert thinking.collapsed
-        assert str(title.content) == "+ 思考"
+        assert str(title.content) == "+ Thinking"
         assert "先分析" not in app.export_screenshot()
         prompt.value = "next draft"
 
         await pilot.click(title, offset=(1, 0))
         assert not thinking.collapsed
-        assert str(title.content) == "- 思考"
+        assert str(title.content) == "- Thinking"
         assert "[bold]先分析[/bold]" in app.export_screenshot()
         client.release[1].set()
         await asyncio.wait_for(client.reached[2].wait(), timeout=2)
         await pilot.pause()
         assert "再回答" in app.export_screenshot()
-        assert app.query_one("#status", Static).content == "生成中…"
+        assert app.query_one("#status", Static).content == "Generating..."
         assert not thinking.collapsed
 
         await pilot.click(title, offset=(1, 0))
@@ -140,7 +140,7 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
             assert "opaque-" not in app.export_screenshot()
             assert app.query_one(".thinking-content", Static).content == "先分析\n再回答"
             assert app.query_one(".reply", Static).content == "你好，世界\n"
-            assert app.query_one("#status", Static).content == "生成中…"
+            assert app.query_one("#status", Static).content == "Generating..."
             assert not stream.closed
             await pilot.click(title, offset=(1, 0))
             assert "先分析" not in app.export_screenshot()
@@ -157,7 +157,7 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
         prompt.value = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        assert app.query_one("#status", Static).content == "就绪"
+        assert app.query_one("#status", Static).content == "Ready"
 
     assert len(transport.requests) == 2
     second_request = json.loads(transport.requests[1].content)
@@ -229,7 +229,7 @@ async def test_yaml_to_sdk_to_visible_reply_before_terminal_event(
         await pilot.pause()
         expected = "抱歉，无法回答。\n" if refusal else "你好，世界\n"
         assert app.query_one(".reply", Static).content == expected
-        assert app.query_one("#status", Static).content == "生成中…"
+        assert app.query_one("#status", Static).content == "Generating..."
         assert not stream.closed
         assert len(transport.requests) == 1
 
@@ -242,7 +242,7 @@ async def test_yaml_to_sdk_to_visible_reply_before_terminal_event(
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         assert stream.closed
-        assert app.query_one("#status", Static).content == "就绪"
+        assert app.query_one("#status", Static).content == "Ready"
         assert app.query_one(".reply", Static).content == expected
         await pilot.press("ctrl+c")
 
@@ -366,8 +366,8 @@ async def test_request_error_preserves_transcript_and_draft_without_rendering_cr
         release_failure.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert app.is_running
-        assert "失败" in str(app.query_one(".turn-status", Static).content)
-        assert app.query_one("#status", Static).content == "就绪"
+        assert "Request failed" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "Ready"
         assert prompt.value == "follow-up"
         assert len(requests) == 2
         assert "test-secret-never-display" not in app.export_screenshot()
@@ -412,7 +412,7 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
             await asyncio.wait_for(pending.closing.wait(), timeout=2)
             assert app.is_running
             assert not pending.closed
-            assert app.query_one("#status", Static).content == "取消中…"
+            assert app.query_one("#status", Static).content == "Cancelling..."
             assert prompt.value == "follow-up"
             await pilot.press("enter", "ctrl+c")
             assert len(transport.requests) == 2
@@ -423,8 +423,8 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
                 await asyncio.wait_for(worker.wait(), timeout=2)
         assert pending.closed
         assert app.is_running
-        assert app.query_one("#status", Static).content == "就绪"
-        assert "已取消" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "Ready"
+        assert "Cancelled" in str(app.query_one(".turn-status", Static).content)
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好" if partial else ""]
         assert prompt.value == "follow-up"
         await pilot.press("enter")
@@ -552,13 +552,13 @@ async def test_incomplete_turn_stays_visible_and_out_of_next_request(
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert incomplete.closed
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好，世界\n"]
-        assert "未完成" in str(app.query_one(".turn-status", Static).content)
-        assert app.query_one("#status", Static).content == "就绪"
+        assert "Reply incomplete" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "Ready"
         prompt.value = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert len(app.query(".reply")) == 3
-        assert "未完成" in str(app.query_one(".turn-status", Static).content)
+        assert "Reply incomplete" in str(app.query_one(".turn-status", Static).content)
         assert [user.content for user in app.query(".user").results(Static)] == ["first", "unfinished", "follow-up"]
     field = "messages" if protocol == "anthropic" else "input"
     assert len(transport.requests) == 3

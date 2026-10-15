@@ -66,7 +66,7 @@ async def test_turn_commit_requires_final_success_and_finished_cleanup(
             await asyncio.wait_for(pending.closing.wait(), timeout=2)
             assert received == [TextDelta("你好"), TextDelta("，世界\n")]
             assert not consuming.done()
-            with pytest.raises(RuntimeError, match="进行"):
+            with pytest.raises(RuntimeError, match="in progress"):
                 await anext(client.stream_reply("too soon"))
             assert len(transport.requests) == 2
         finally:
@@ -106,7 +106,7 @@ async def test_unfinished_turn_preserves_previously_completed_history(protocol: 
             async for event in client.stream_reply("unfinished"):
                 received.append(event)
         if ending.startswith("tool_"):
-            assert "不支持工具" in str(caught.value)
+            assert "tool requests are not supported" in str(caught.value)
         assert received == [TextDelta("你好"), TextDelta("，世界\n")]
         _ = [event async for event in client.stream_reply("follow-up")]
     field = "messages" if protocol == "anthropic" else "input"

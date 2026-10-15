@@ -15,7 +15,7 @@ from replux.llm import IncompleteReplyError, LLMClient, LLMError, ReplyCompleted
 
 class RepluxApp(App[None]):
     TITLE = "Replux"
-    BINDINGS = [Binding("ctrl+c", "cancel_or_quit", "取消 / 退出", priority=True)]
+    BINDINGS = [Binding("ctrl+c", "cancel_or_quit", "Cancel / Quit", priority=True)]
     CSS = """
     #composer { dock: bottom; height: auto; }
     #status { height: 1; padding: 0 1; color: $text-muted; }
@@ -36,8 +36,8 @@ class RepluxApp(App[None]):
     def compose(self) -> ComposeResult:
         yield Header()
         with Vertical(id="composer"):
-            yield Static("就绪", id="status")
-            yield Input(placeholder="输入问题，按 Enter 发送", id="prompt")
+            yield Static("Ready", id="status")
+            yield Input(placeholder="Type a message and press Enter to send", id="prompt")
         yield VerticalScroll(id="transcript")
 
     def on_mount(self) -> None:
@@ -48,7 +48,7 @@ class RepluxApp(App[None]):
             return
         self._generating = True
         event.input.value = ""
-        self.query_one("#status", Static).update("生成中…")
+        self.query_one("#status", Static).update("Generating...")
         self._run_reply(event.value)
 
     def action_cancel_or_quit(self) -> None:
@@ -56,7 +56,7 @@ class RepluxApp(App[None]):
             self.exit()
         elif not self._cancelling:
             self._cancelling = True
-            self.query_one("#status", Static).update("取消中…")
+            self.query_one("#status", Static).update("Cancelling...")
             if self._reply_task is not None:
                 self._reply_task.cancel()
 
@@ -82,7 +82,7 @@ class RepluxApp(App[None]):
             self._generating = False
             self._cancelling = False
             if self.is_running:
-                self.query_one("#status", Static).update("就绪")
+                self.query_one("#status", Static).update("Ready")
 
     async def _show_reply(self, user_input: str) -> None:
         transcript = self.query_one("#transcript", VerticalScroll)
@@ -108,7 +108,7 @@ class RepluxApp(App[None]):
                             thinking = Static(thinking_text, classes="thinking-content", markup=False)
                             await transcript.mount(
                                 Collapsible(
-                                    thinking, title="思考", collapsed=True,
+                                    thinking, title="Thinking", collapsed=True,
                                     collapsed_symbol="+", expanded_symbol="-", classes="thinking",
                                 ),
                                 before=reply,
@@ -117,14 +117,14 @@ class RepluxApp(App[None]):
                             thinking.update(thinking_text)
                         transcript.scroll_end(animate=False)
                     elif isinstance(event, ReplyCompleted):
-                        self.query_one("#status", Static).update("就绪")
+                        self.query_one("#status", Static).update("Ready")
         except asyncio.CancelledError:
             if self.is_running:
-                await transcript.mount(Static("已取消", classes="turn-status", markup=False))
+                await transcript.mount(Static("Cancelled", classes="turn-status", markup=False))
                 transcript.scroll_end(animate=False)
             raise
         except LLMError as error:
-            message = str(error) if isinstance(error, IncompleteReplyError) else f"请求失败：{error}"
+            message = str(error) if isinstance(error, IncompleteReplyError) else f"Request failed: {error}"
             await transcript.mount(Static(message, classes="turn-status", markup=False))
             transcript.scroll_end(animate=False)
 

@@ -78,7 +78,7 @@ raise SystemExit(app.return_code)
             output.extend(os.read(master, 65536))
 
     try:
-        read_until("输入问题".encode())
+        read_until("Type a message".encode())
         assert b"\x1b[?1049h" in output
         assert b"Replux" in output
         if injected:
@@ -86,7 +86,7 @@ raise SystemExit(app.return_code)
             if entry == "cancel":
                 read_until("你好".encode())
                 os.write(master, b"\x03")
-                read_until("已取消".encode())
+                read_until("Cancelled".encode())
                 assert process.poll() is None
                 os.write(master, b"\x03")
             read_until(b"REPLUX_RESOURCES:False:True:0" if entry == "early-exit" else b"REPLUX_RESOURCES:True:True:1")
