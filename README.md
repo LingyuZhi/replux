@@ -7,10 +7,10 @@ Replux 是一个终端 AI 助手。支持通过 Anthropic Messages 或 OpenAI Re
 
 ```sh
 uv sync --dev
-uv run replux
 ```
 
-启动前创建 `~/.replux/config.yaml`，填写完整模型名与密钥：
+创建 `~/.replux/config.yaml`（目录不存在时先创建 `~/.replux/`），填写完整模型名与密钥。
+四个必填字段是 `protocol`、`model`、`base_url` 和 `api_key`：
 
 ```yaml
 protocol: anthropic
@@ -19,6 +19,12 @@ base_url: https://api.anthropic.com
 api_key: your-api-key
 max_output_tokens: 8192
 timeout_seconds: 120
+```
+
+保存配置后启动：
+
+```sh
+uv run replux
 ```
 
 Anthropic 可按模型支持情况添加 `thinking`。省略时保持模型默认行为。
@@ -59,7 +65,8 @@ uv run python -m replux --config /path/to/config.yaml
 
 每次启动仅读取一份配置，修改后需重启。`api_key` 按字面读取；
 `base_url` 直接交给 SDK，兼容端点需填写其要求的根地址。
-`max_output_tokens` 和 `timeout_seconds` 可省略。`timeout_seconds` 控制网络 I/O 等待时间。
+`max_output_tokens` 和 `timeout_seconds` 可省略，默认分别为 `8192` 和 `120` 秒。
+`timeout_seconds` 控制网络 I/O 等待时间，不是整轮生成的总时限。
 请求自动重试已关闭。
 
 在底部输入问题，按 `Enter` 发送，按 `Ctrl+J` 换行。可粘贴中文多行内容，保留换行与缩进；纯空白不会发送。
@@ -67,7 +74,8 @@ uv run python -m replux --config /path/to/config.yaml
 可用 `Tab` 切换焦点，在对话区用 `PageUp` / `PageDown` 翻页、`End` 回到底部。
 生成时按 `Ctrl+C` 取消当前回复，等待请求流关闭后可再次发送；
 空闲时按 `Ctrl+C` 退出。生成期间可以编辑下一条草稿，但不能重复发送。
-取消、未完成或截断的回复会保留在界面并标记，不进入后续上下文；需要重发问题。
+取消、失败或截断的轮次会保留在界面并标记，问题和半截回复均不进入后续上下文；
+需要重新提交完整问题，不能仅用“继续”续接该轮。
 认证、限流、网络或 API 错误会显示在当前轮次，保留草稿并恢复输入，不自动重试。
 启动配置错误和程序缺陷仍会报错退出。
 
