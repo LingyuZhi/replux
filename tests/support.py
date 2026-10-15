@@ -156,10 +156,15 @@ class ControlledSSE(httpx.AsyncByteStream):
         *,
         gate_after: int | None = None,
         close_error: Exception | None = None,
+        suppress_cancel: bool = False,
+        read_error: Exception | None = None,
     ) -> None:
         self.events = reply_events() if events is None else events
         self.gate_after = gate_after
         self.close_error = close_error
+        self.suppress_cancel = suppress_cancel
+        self.read_error = read_error
+        self.cancelled = asyncio.Event()
         self.blocked = asyncio.Event()
         self.release = asyncio.Event()
         self.closing = asyncio.Event()
@@ -172,7 +177,15 @@ class ControlledSSE(httpx.AsyncByteStream):
             yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
             if index == self.gate_after:
                 self.blocked.set()
-                await self.release.wait()
+                try:
+                    await self.release.wait()
+                except asyncio.CancelledError:
+                    self.cancelled.set()
+                    if not self.suppress_cancel:
+                        raise
+                    await self.release.wait()
+        if self.read_error is not None:
+            raise self.read_error
 
     async def aclose(self) -> None:
         self.closing.set()

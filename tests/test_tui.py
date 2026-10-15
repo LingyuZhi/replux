@@ -2,15 +2,18 @@ import asyncio
 from collections.abc import AsyncGenerator
 import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 import httpx2 as httpx
+from textual.worker import WorkerCancelled, WorkerFailed
 from textual.widgets import Collapsible, Input, Static
 
 from replux.cli import create_app
-from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta
+from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta, create_client
 from replux.tui import RepluxApp
-from tests.support import ControlledSSE, RecordingTransport, native_reply, reply_events, thinking_events, unfinished_events
+from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events, thinking_events, unfinished_events
 from tests.test_config import VALID_YAML
 
 
@@ -326,26 +329,123 @@ async def test_tui_accepts_a_scripted_llm_client_and_preserves_input() -> None:
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
-async def test_request_error_exits_without_rendering_credentials(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], protocol: str
+@pytest.mark.parametrize("status_code", [401, 429, 400, 500])
+async def test_request_error_preserves_transcript_and_draft_without_rendering_credentials(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture,
+    protocol: str, status_code: int,
 ) -> None:
     config = tmp_path / "provider.yaml"
     config.write_text(VALID_YAML.replace("protocol: anthropic", f"protocol: {protocol}"), encoding="utf-8")
+    requests: list[httpx.Request] = []
+    streams: list[ControlledSSE] = []
+    failing = asyncio.Event()
+    release_failure = asyncio.Event()
 
-    def reject(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(401, json={"error": {"type": "authentication_error", "message": "rejected test-secret-never-display"}})
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 2:
+            failing.set()
+            await release_failure.wait()
+            return httpx.Response(status_code, headers={"retry-after": "60"}, json={"error": {
+                "type": "invalid_request_error", "message": "context too long; test-secret-never-display",
+            }})
+        stream = ControlledSSE(reply_events(protocol))
+        streams.append(stream)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
 
-    app = create_app(["--config", str(config)], transport=httpx.MockTransport(reject))
+    app = create_app(["--config", str(config)], transport=httpx.MockTransport(respond))
     async with app.run_test() as pilot:
-        app.query_one("#prompt", Input).value = "hello"
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = "first"
         await pilot.press("enter")
-    assert app.return_code == 1
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        prompt.value = "failed"
+        await pilot.press("enter")
+        await asyncio.wait_for(failing.wait(), timeout=2)
+        prompt.value = "follow-up"
+        release_failure.set()
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert app.is_running
+        assert "失败" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "就绪"
+        assert prompt.value == "follow-up"
+        assert len(requests) == 2
+        assert "test-secret-never-display" not in app.export_screenshot()
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert [user.content for user in app.query(".user").results(Static)] == ["first", "failed", "follow-up"]
+        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "", "你好，世界\n"]
+        await pilot.press("ctrl+c")
+    field = "messages" if protocol == "anthropic" else "input"
+    assert len(requests) == 3
+    assert json.loads(requests[-1].content)[field] == [
+        {"role": "user", "content": "first"}, *native_reply(protocol),
+        {"role": "user", "content": "follow-up"},
+    ]
+    assert all(stream.closed for stream in streams)
+    assert app.return_code == 0
     captured = capsys.readouterr()
-    assert "test-secret-never-display" not in captured.out + captured.err
+    assert "test-secret-never-display" not in captured.out + captured.err + caplog.text
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
-async def test_exit_waits_for_in_progress_stream_cleanup(tmp_path: Path, protocol: str) -> None:
+@pytest.mark.parametrize("partial", [False, True], ids=["before-text", "partial-text"])
+async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: str, partial: bool) -> None:
+    gate = (2 if protocol == "anthropic" else 4) if partial else 0
+    pending = ControlledSSE(reply_events(protocol), gate_after=gate)
+    pending.release_close.clear()
+    streams = [ControlledSSE(reply_events(protocol)), pending, ControlledSSE(reply_events(protocol))]
+    transport = RecordingTransport(streams)
+    app = RepluxApp(create_client(provider_config(protocol), transport=transport))
+    async with app.run_test() as pilot:
+        prompt = app.query_one("#prompt", Input)
+        prompt.value = "first"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        prompt.value = "cancelled"
+        await pilot.press("enter")
+        await asyncio.wait_for(pending.blocked.wait(), timeout=2)
+        worker = next(iter(app.workers))
+        prompt.value = "follow-up"
+        try:
+            await pilot.press("ctrl+c")
+            await asyncio.wait_for(pending.closing.wait(), timeout=2)
+            assert app.is_running
+            assert not pending.closed
+            assert app.query_one("#status", Static).content == "取消中…"
+            assert prompt.value == "follow-up"
+            await pilot.press("enter", "ctrl+c")
+            assert len(transport.requests) == 2
+            assert not pending.closed
+        finally:
+            pending.release_close.set()
+            with pytest.raises(WorkerCancelled):
+                await asyncio.wait_for(worker.wait(), timeout=2)
+        assert pending.closed
+        assert app.is_running
+        assert app.query_one("#status", Static).content == "就绪"
+        assert "已取消" in str(app.query_one(".turn-status", Static).content)
+        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好" if partial else ""]
+        assert prompt.value == "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert len(app.query(".reply")) == 3
+        await pilot.press("ctrl+c")
+    field = "messages" if protocol == "anthropic" else "input"
+    assert len(transport.requests) == 3
+    assert json.loads(transport.requests[-1].content)[field] == [
+        {"role": "user", "content": "first"}, *native_reply(protocol),
+        {"role": "user", "content": "follow-up"},
+    ]
+    assert all(stream.closed for stream in streams)
+    assert transport.closed
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+@pytest.mark.parametrize("cancel_first", [False, True], ids=["exit", "exit-during-cancellation"])
+async def test_exit_waits_for_in_progress_stream_cleanup(
+    tmp_path: Path, protocol: str, cancel_first: bool,
+) -> None:
     config = tmp_path / "provider.yaml"
     config.write_text(VALID_YAML.replace("protocol: anthropic", f"protocol: {protocol}"), encoding="utf-8")
     stream = ControlledSSE(reply_events(protocol), gate_after=0)
@@ -358,6 +458,9 @@ async def test_exit_waits_for_in_progress_stream_cleanup(tmp_path: Path, protoco
             app.query_one("#prompt", Input).value = "hello"
             await pilot.press("enter")
             await asyncio.wait_for(stream.blocked.wait(), timeout=2)
+            if cancel_first:
+                await pilot.press("ctrl+c")
+                await asyncio.wait_for(stream.closing.wait(), timeout=2)
             app.exit()
 
     exiting = asyncio.create_task(session())
@@ -371,6 +474,62 @@ async def test_exit_waits_for_in_progress_stream_cleanup(tmp_path: Path, protoco
         await asyncio.wait_for(exiting, timeout=2)
     assert stream.closed
     assert transport.closed
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_programming_error_terminates_chat_and_releases_resources(protocol: str) -> None:
+    events = reply_events(protocol)
+    stream = ControlledSSE(events[:3 if protocol == "anthropic" else 5], read_error=RuntimeError("injected defect"))
+    transport = RecordingTransport(stream)
+    app = RepluxApp(create_client(provider_config(protocol), transport=transport))
+    with pytest.raises(WorkerFailed, match="injected defect"):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt", Input).value = "hello"
+            await pilot.press("enter")
+            await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    assert app.return_code == 1
+    assert stream.closed
+    assert transport.closed
+    assert len(transport.requests) == 1
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+def test_immediate_exit_does_not_leave_an_unobserved_reply_task(protocol: str) -> None:
+    # A fresh loop and process expose unawaited coroutines and unobserved task
+    # exceptions even when Textual has already removed a cancelled worker.
+    result = subprocess.run(
+        [sys.executable, "-c", """
+import asyncio
+import gc
+import sys
+from textual.widgets import Input
+from replux.llm import create_client
+from replux.tui import RepluxApp
+from tests.support import ControlledSSE, RecordingTransport, provider_config, reply_events
+
+class ExitOnSubmitApp(RepluxApp):
+    def on_input_submitted(self, event):
+        super().on_input_submitted(event)
+        self.exit()
+
+async def session():
+    protocol = sys.argv[1]
+    stream = ControlledSSE(reply_events(protocol), gate_after=0)
+    transport = RecordingTransport(stream)
+    app = ExitOnSubmitApp(create_client(provider_config(protocol), transport=transport))
+    async with app.run_test() as pilot:
+        app.query_one('#prompt', Input).value = 'hello'
+        await pilot.press('enter')
+    print(app.return_code, transport.closed, len(transport.requests))
+
+asyncio.run(session())
+gc.collect()
+""", protocol],
+        cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0 True 0"
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])

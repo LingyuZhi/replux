@@ -1,12 +1,13 @@
 """Provider-independent reply events and streaming protocol adapters."""
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
+import asyncio
+from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass
 from types import TracebackType
 from typing import Self, cast
 
-from anthropic import APIError, APIStatusError, AsyncAnthropic, DefaultAsyncHttpxClient, omit
+from anthropic import APIConnectionError, APIError, APITimeoutError, AsyncAnthropic, DefaultAsyncHttpxClient, omit
 from anthropic.types import ContentBlock, MessageParam
 import httpx2 as httpx
 import openai
@@ -39,9 +40,106 @@ StreamEvent = TextDelta | ThinkingDelta | ReplyCompleted
 class LLMError(RuntimeError):
     """A known request failure, including an incomplete reply."""
 
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class AuthenticationError(LLMError):
+    """The service rejected the credentials."""
+
+
+class RateLimitError(LLMError):
+    """The service rate limit was reached; retry_after is informational only."""
+
+    def __init__(
+        self, message: str, *, status_code: int | None = None, retry_after: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.retry_after = retry_after
+
+
+class NetworkError(LLMError):
+    """The connection failed or a network operation timed out."""
+
 
 class IncompleteReplyError(LLMError):
     """The stream ended without a supported, complete reply."""
+
+
+def _request_error(
+    error: APIError | openai.APIError | httpx.HTTPError, *, thinking: bool = False,
+) -> LLMError:
+    status_code: int | None = getattr(error, "status_code", None)
+    if isinstance(error, (APITimeoutError, openai.APITimeoutError, httpx.TimeoutException)):
+        return NetworkError("网络请求超时，请检查连接或稍后重试。", status_code=status_code)
+    if isinstance(error, (APIConnectionError, openai.APIConnectionError, httpx.RequestError)):
+        return NetworkError("网络连接失败，请检查连接或稍后重试。", status_code=status_code)
+    body = getattr(error, "body", None)
+    details = body.get("error", body) if isinstance(body, dict) else None
+    code = details.get("code") or details.get("type") if isinstance(details, dict) else None
+    response = getattr(error, "response", None)
+    return _response_error(
+        status_code=status_code, code=code if isinstance(code, str) else None,
+        retry_after=response.headers.get("retry-after") if response is not None else None,
+        thinking=thinking,
+    )
+
+
+def _response_error(
+    *, status_code: int | None, code: str | None = None,
+    retry_after: str | None = None, thinking: bool = False,
+) -> LLMError:
+    # Interpret known codes, but never display server bodies or invent HTTP status.
+    if status_code == 401 or code in {"authentication_error", "invalid_api_key"}:
+        return AuthenticationError("认证失败，请检查 api_key。", status_code=status_code)
+    if status_code == 429 or code in {"rate_limit_error", "rate_limit_exceeded"}:
+        return RateLimitError("请求被限流，请稍后手动重试。", status_code=status_code, retry_after=retry_after)
+    if status_code == 400:
+        message = (
+            "模型拒绝请求，请检查 thinking 配置及其他请求参数。" if thinking
+            else "模型拒绝请求，请检查请求参数或对话上下文长度。"
+        )
+        return LLMError(message, status_code=status_code)
+    return LLMError("模型请求失败，请检查连接配置或服务状态。", status_code=status_code)
+
+
+def _raise_if_cancelled() -> None:
+    # A transport can finish an awaited read after cancellation was requested.
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
+
+
+class _ResponseStream(httpx.AsyncByteStream):
+    """Keep actual response cleanup alive when the SDK closes implicitly."""
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self._stream = stream
+
+    def __aiter__(self) -> AsyncIterator[bytes]:
+        return self._stream.__aiter__()
+
+    async def aclose(self) -> None:
+        closing = asyncio.create_task(self._stream.aclose())
+        try:
+            await asyncio.shield(closing)
+        except asyncio.CancelledError:
+            # Cancellation must not release the client while the response is open.
+            while not closing.done():
+                try:
+                    await asyncio.shield(closing)
+                except asyncio.CancelledError:
+                    pass
+            closing.result()
+            raise
+
+
+async def _protect_response_cleanup(response: httpx.Response) -> None:
+    # HTTPX marks a response closed before awaiting the underlying stream. Guard
+    # that stream so a later SDK close cannot skip unfinished network cleanup.
+    assert isinstance(response.stream, httpx.AsyncByteStream)
+    response.stream = _ResponseStream(response.stream)
 
 
 class LLMClient(ABC):
@@ -77,7 +175,9 @@ class AnthropicClient(LLMClient):
             base_url=config.base_url,
             timeout=config.timeout_seconds,
             max_retries=0,
-            http_client=DefaultAsyncHttpxClient(transport=transport) if transport else None,
+            http_client=DefaultAsyncHttpxClient(
+                transport=transport, event_hooks={"response": [_protect_response_cleanup]},
+            ),
         )
 
     async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
@@ -100,6 +200,7 @@ class AnthropicClient(LLMClient):
                 stream=True,
             ) as stream:
                 async for event in stream:
+                    _raise_if_cancelled()
                     if event.type == "content_block_delta":
                         block = content[event.index]
                         if event.delta.type == "text_delta":
@@ -135,6 +236,7 @@ class AnthropicClient(LLMClient):
                     elif event.type == "message_stop":
                         stopped = True
                         break
+            _raise_if_cancelled()
             if not started or not stopped or stop_reason is None:
                 raise IncompleteReplyError("回复未完成：缺少完整的结束信号。")
             if stop_reason == "tool_use":
@@ -145,10 +247,8 @@ class AnthropicClient(LLMClient):
             self._history.extend([user_message, {"role": "assistant", "content": content}])
             yield ReplyCompleted(stop_reason, input_tokens, output_tokens)
         except (APIError, httpx.HTTPError) as error:
-            # Keep the cause for callers, but never display a server's error body.
-            if isinstance(error, APIStatusError) and error.status_code == 400 and self._config.thinking is not None:
-                raise LLMError("模型拒绝请求，请检查 thinking 配置及其他请求参数。") from error
-            raise LLMError("模型请求失败，请检查连接配置或服务状态。") from error
+            _raise_if_cancelled()
+            raise _request_error(error, thinking=self._config.thinking is not None) from error
         finally:
             self._active = False
 
@@ -168,7 +268,9 @@ class OpenAIClient(LLMClient):
             base_url=config.base_url,
             timeout=config.timeout_seconds,
             max_retries=0,
-            http_client=openai.DefaultAsyncHttpxClient(transport=transport) if transport else None,
+            http_client=openai.DefaultAsyncHttpxClient(
+                transport=transport, event_hooks={"response": [_protect_response_cleanup]},
+            ),
         )
 
     async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
@@ -186,6 +288,7 @@ class OpenAIClient(LLMClient):
                 stream=True,
             ) as stream:
                 async for event in stream:
+                    _raise_if_cancelled()
                     if event.type in {"response.output_text.delta", "response.refusal.delta"}:
                         yield TextDelta(event.delta)
                     elif event.type == "response.completed":
@@ -194,10 +297,17 @@ class OpenAIClient(LLMClient):
                     elif event.type == "response.incomplete":
                         raise IncompleteReplyError("回复未完成：输出达到上限或响应被中断。")
                     elif event.type in {"response.failed", "error"}:
-                        raise LLMError("模型请求失败，服务端未完成回复。")
+                        code = event.code if event.type == "error" else (
+                            event.response.error.code if event.response.error is not None else None
+                        )
+                        raise _response_error(
+                            status_code=stream.response.status_code, code=code,
+                            retry_after=stream.response.headers.get("retry-after"),
+                        )
                     elif event.type in {"response.output_item.added", "response.output_item.done"}:
                         if event.item.type not in {"message", "reasoning"}:
                             raise IncompleteReplyError("回复未完成：当前版本不支持工具请求。")
+            _raise_if_cancelled()
             if final is None or final.status != "completed":
                 raise IncompleteReplyError("回复未完成：缺少完整的结束信号。")
             for item in final.output:
@@ -215,8 +325,8 @@ class OpenAIClient(LLMClient):
                 getattr(usage, "output_tokens", None),
             )
         except (openai.APIError, httpx.HTTPError) as error:
-            # Keep the cause for callers, but never display a server's error body.
-            raise LLMError("模型请求失败，请检查连接配置或服务状态。") from error
+            _raise_if_cancelled()
+            raise _request_error(error) from error
         finally:
             self._active = False
 

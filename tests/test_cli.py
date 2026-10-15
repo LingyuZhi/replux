@@ -15,7 +15,7 @@ from tests.test_config import VALID_YAML
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
-@pytest.mark.parametrize("entry", ["command", "module"])
+@pytest.mark.parametrize("entry", ["command", "module", "cancel", "defect", "early-exit"])
 def test_public_entry_opens_full_screen_and_restores_terminal(
     tmp_path: Path, entry: str, protocol: str
 ) -> None:
@@ -26,6 +26,35 @@ def test_public_entry_opens_full_screen_and_restores_terminal(
         if entry == "command"
         else [sys.executable, "-m", "replux"]
     )
+    injected = entry in {"cancel", "defect", "early-exit"}
+    if injected:
+        command = [sys.executable, "-c", """
+import os
+import replux.cli as cli
+from replux.tui import RepluxApp
+from tests.support import ControlledSSE, RecordingTransport, reply_events
+
+protocol = os.environ["REPLUX_TEST_PROTOCOL"]
+scenario = os.environ["REPLUX_TEST_SCENARIO"]
+if scenario == "early-exit":
+    class ExitingApp(RepluxApp):
+        def on_input_submitted(self, event):
+            super().on_input_submitted(event)
+            self.exit()
+    cli.RepluxApp = ExitingApp
+gate = 2 if protocol == "anthropic" else 4
+events = reply_events(protocol)
+stream = ControlledSSE(
+    events if scenario == "cancel" else events[:gate + 1],
+    gate_after=gate if scenario == "cancel" else None,
+    read_error=RuntimeError("injected defect") if scenario == "defect" else None,
+)
+transport = RecordingTransport(stream)
+app = cli.create_app(transport=transport)
+app.run()
+print(f"REPLUX_RESOURCES:{stream.closed}:{transport.closed}:{len(transport.requests)}", flush=True)
+raise SystemExit(app.return_code)
+"""]
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     original = termios.tcgetattr(slave)
@@ -34,7 +63,8 @@ def test_public_entry_opens_full_screen_and_restores_terminal(
         stdin=slave,
         stdout=slave,
         stderr=slave,
-        env={**os.environ, "TERM": "xterm-256color"},
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "TERM": "xterm-256color", "REPLUX_TEST_PROTOCOL": protocol, "REPLUX_TEST_SCENARIO": entry},
     )
     output = bytearray()
 
@@ -51,9 +81,25 @@ def test_public_entry_opens_full_screen_and_restores_terminal(
         read_until("输入问题".encode())
         assert b"\x1b[?1049h" in output
         assert b"Replux" in output
-        os.write(master, b"\x03")
+        if injected:
+            os.write(master, b"hello\r")
+            if entry == "cancel":
+                read_until("你好".encode())
+                os.write(master, b"\x03")
+                read_until("已取消".encode())
+                assert process.poll() is None
+                os.write(master, b"\x03")
+            read_until(b"REPLUX_RESOURCES:False:True:0" if entry == "early-exit" else b"REPLUX_RESOURCES:True:True:1")
+        else:
+            os.write(master, b"\x03")
         read_until(b"\x1b[?1049l")
-        assert process.wait(timeout=10) == 0
+        assert process.wait(timeout=10) == (1 if entry == "defect" else 0)
+        while select.select([master], [], [], 0)[0]:
+            output.extend(os.read(master, 65536))
+        assert b"RuntimeWarning" not in output
+        assert b"Task exception was never retrieved" not in output
+        if entry == "defect":
+            assert b"injected defect" in output
         assert termios.tcgetattr(slave) == original
         assert b"test-secret-never-display" not in output
     finally:

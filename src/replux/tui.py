@@ -1,7 +1,9 @@
 """Full-screen text chat using the shared LLM interface."""
 
+import asyncio
 from contextlib import aclosing
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -13,7 +15,7 @@ from replux.llm import IncompleteReplyError, LLMClient, LLMError, ReplyCompleted
 
 class RepluxApp(App[None]):
     TITLE = "Replux"
-    BINDINGS = [Binding("ctrl+c", "quit", "退出", priority=True)]
+    BINDINGS = [Binding("ctrl+c", "cancel_or_quit", "取消 / 退出", priority=True)]
     CSS = """
     #composer { dock: bottom; height: auto; }
     #status { height: 1; padding: 0 1; color: $text-muted; }
@@ -28,6 +30,8 @@ class RepluxApp(App[None]):
         super().__init__()
         self._client = client
         self._generating = False
+        self._cancelling = False
+        self._reply_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -45,16 +49,51 @@ class RepluxApp(App[None]):
         self._generating = True
         event.input.value = ""
         self.query_one("#status", Static).update("生成中…")
-        self.run_worker(self._show_reply(event.value), name="reply")
+        self._run_reply(event.value)
+
+    def action_cancel_or_quit(self) -> None:
+        if not self._generating:
+            self.exit()
+        elif not self._cancelling:
+            self._cancelling = True
+            self.query_one("#status", Static).update("取消中…")
+            if self._reply_task is not None:
+                self._reply_task.cancel()
+
+    @work(name="reply", description="Stream the current reply")
+    async def _run_reply(self, user_input: str) -> None:
+        reply = self._reply_task = asyncio.create_task(self._show_reply(user_input))
+        try:
+            await asyncio.shield(reply)
+        except asyncio.CancelledError:
+            # Textual also cancels workers on exit. Forward cancellation once so
+            # exiting during an existing cancellation cannot interrupt cleanup.
+            if not reply.cancelling():
+                reply.cancel()
+            while not reply.done():
+                try:
+                    await asyncio.shield(reply)
+                except asyncio.CancelledError:
+                    pass
+            reply.result()
+            raise
+        finally:
+            self._reply_task = None
+            self._generating = False
+            self._cancelling = False
+            if self.is_running:
+                self.query_one("#status", Static).update("就绪")
 
     async def _show_reply(self, user_input: str) -> None:
         transcript = self.query_one("#transcript", VerticalScroll)
         reply = Static("", classes="reply", markup=False)
-        await transcript.mount(Static(user_input, classes="user", markup=False), reply)
         text = ""
         thinking_text = ""
         thinking: Static | None = None
         try:
+            await transcript.mount(Static(user_input, classes="user", markup=False), reply)
+            if self._cancelling:
+                raise asyncio.CancelledError
             async with aclosing(self._client.stream_reply(user_input)) as events:
                 async for event in events:
                     if isinstance(event, TextDelta):
@@ -79,13 +118,15 @@ class RepluxApp(App[None]):
                         transcript.scroll_end(animate=False)
                     elif isinstance(event, ReplyCompleted):
                         self.query_one("#status", Static).update("就绪")
-        except IncompleteReplyError as error:
-            await transcript.mount(Static(str(error), classes="turn-status", markup=False))
-            transcript.scroll_end(animate=False)
-            self.query_one("#status", Static).update("就绪")
+        except asyncio.CancelledError:
+            if self.is_running:
+                await transcript.mount(Static("已取消", classes="turn-status", markup=False))
+                transcript.scroll_end(animate=False)
+            raise
         except LLMError as error:
-            self.exit(message=str(error), return_code=1)
-        self._generating = False
+            message = str(error) if isinstance(error, IncompleteReplyError) else f"请求失败：{error}"
+            await transcript.mount(Static(message, classes="turn-status", markup=False))
+            transcript.scroll_end(animate=False)
 
     async def on_unmount(self) -> None:
         try:
