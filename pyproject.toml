@@ -12,6 +12,7 @@ dependencies = [
     "anthropic==1.14.0",
     "httpx2==2.13.1",
     "openai==3.31.0",
+    "pydantic==2.14.1",
     "PyYAML==6.0.3",
     "textual==8.2.8",
 ]

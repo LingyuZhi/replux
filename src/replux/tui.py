@@ -10,10 +10,14 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Key
+from textual.timer import Timer
 from textual.worker import WorkerCancelled
 from textual.widgets import Collapsible, Static, TextArea
 
-from replux.llm import IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, TextDelta, ThinkingDelta
+from replux.llm import (
+    IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, TextDelta, ThinkingDelta, ToolFinished, ToolStarted,
+)
+from replux.tools import ToolResult
 
 
 SPARK_LOGO = "\n".join((
@@ -23,6 +27,73 @@ SPARK_LOGO = "\n".join((
     "  ▀▀█████▀▀  ",
     "     ▀█▀     ",
 ))
+
+
+class ToolCallView(Vertical):
+    """One Tool Call in the Transcript: running indicator, then a short preview."""
+
+    def __init__(self, name: str, summary: str) -> None:
+        super().__init__(name=name, classes="tool-call")
+        self._name = name
+        self._summary = summary
+        self._timer: Timer | None = None
+        self._bright = True
+        self._finished = False
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(classes="tool-heading"):
+            yield Static("●", classes="tool-dot running", markup=False)
+            yield Static(f"{self._name} {self._summary}", classes="tool-header", markup=False)
+            yield Static("running", classes="tool-status", markup=False)
+        yield Static("", classes="tool-preview", markup=False)
+
+    def on_mount(self) -> None:
+        if not self._finished:
+            self._timer = self.set_interval(0.5, self._breathe)
+
+    def _breathe(self) -> None:
+        self._bright = not self._bright
+        self.query_one(".tool-dot", Static).styles.text_opacity = 1.0 if self._bright else 0.3
+
+    def on_collapsible_expanded(self, event: Collapsible.Expanded) -> None:
+        self.query_one(".tool-preview", Static).display = False
+        event.stop()
+
+    def on_collapsible_collapsed(self, event: Collapsible.Collapsed) -> None:
+        self.query_one(".tool-preview", Static).display = True
+        event.stop()
+
+    def finish(self, result: ToolResult, duration_seconds: float | None) -> None:
+        if self._finished:
+            return
+        self._finished = True
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        dot = self.query_one(".tool-dot", Static)
+        dot.remove_class("running")
+        if result.status == "error":
+            dot.add_class("error")
+        dot.styles.text_opacity = 1.0
+        self.query_one(".tool-status", Static).update(_tool_status_text(result, duration_seconds))
+        lines = result.output.split("\n")
+        if lines[-1:] == [""]:
+            lines = lines[:-1]
+        self.query_one(".tool-preview", Static).update("\n".join(lines[:5]))
+        if len(lines) > 5:
+            self.mount(Collapsible(
+                Static(result.output, classes="tool-output", markup=False),
+                title=f"Show all {len(lines)} lines", collapsed=True,
+                collapsed_symbol="+", expanded_symbol="-",
+            ))
+
+    def cancel(self) -> None:
+        self.finish(ToolResult("cancelled", "Cancelled by the user before the tool call finished."), None)
+
+
+def _tool_status_text(result: ToolResult, duration_seconds: float | None) -> str:
+    label = f"error ({result.error_code})" if result.status == "error" else result.status
+    return label if duration_seconds is None else f"{label} · {duration_seconds:.2f}s"
 
 
 class Prompt(TextArea):
@@ -55,6 +126,13 @@ class RepluxApp(App[None]):
     .reply { margin: 1 0; }
     .thinking-content { color: $text-muted; }
     .turn-status { color: $warning; }
+    .tool-call { height: auto; margin: 1 0; }
+    .tool-heading { height: 1; }
+    .tool-dot { width: 2; color: $accent; }
+    .tool-dot.error { color: $error; }
+    .tool-header { width: auto; margin-right: 1; }
+    .tool-status { width: 1fr; color: $text-muted; text-wrap: nowrap; text-overflow: ellipsis; }
+    .tool-preview, .tool-output { color: $text-muted; }
     """
 
     def __init__(self, client: LLMClient, *, model: str) -> None:
@@ -136,19 +214,25 @@ class RepluxApp(App[None]):
 
     async def _show_reply(self, user_input: str) -> None:
         transcript = self.query_one("#transcript-content", Vertical)
-        reply = Static("", classes="reply", markup=False)
+        first_reply = Static("", classes="reply", markup=False)
+        reply: Static | None = first_reply
         text = ""
         thinking_text = ""
         thinking: Static | None = None
+        tools: dict[str, ToolCallView] = {}
         try:
             self._follow_transcript()
-            await transcript.mount(Static(user_input, classes="user", markup=False), reply)
+            await transcript.mount(Static(user_input, classes="user", markup=False), first_reply)
             if self._cancelling:
                 raise asyncio.CancelledError
             async with aclosing(self._client.stream_reply(user_input)) as events:
                 async for event in events:
                     self._follow_transcript()
                     if isinstance(event, TextDelta):
+                        if reply is None:
+                            reply = Static("", classes="reply", markup=False)
+                            text = ""
+                            await transcript.mount(reply)
                         text += event.text
                         reply.update(text)
                     elif isinstance(event, ThinkingDelta) and event.text:
@@ -162,13 +246,30 @@ class RepluxApp(App[None]):
                                     thinking, title="Thinking", collapsed=True,
                                     collapsed_symbol="+", expanded_symbol="-", classes="thinking",
                                 ),
-                                before=reply,
+                                before=first_reply,
                             )
                         else:
                             thinking.update(thinking_text)
+                    elif isinstance(event, ToolStarted):
+                        view = ToolCallView(event.name, event.summary)
+                        tools[event.call_id] = view
+                        await transcript.mount(view)
+                        self.query_one("#status", Static).update(f"Running {event.name}...")
+                        reply = None
+                    elif isinstance(event, ToolFinished):
+                        finished = tools.get(event.call_id)
+                        if finished is None:
+                            finished = ToolCallView(event.name, event.summary)
+                            tools[event.call_id] = finished
+                            await transcript.mount(finished)
+                        finished.finish(event.result, event.duration_seconds)
+                        self.query_one("#status", Static).update("Generating...")
+                        reply = None
                     elif isinstance(event, ReplyCompleted):
                         self.query_one("#status", Static).update("Ready")
         except asyncio.CancelledError:
+            for view in tools.values():
+                view.cancel()
             if self.is_running:
                 self._follow_transcript()
                 await transcript.mount(Static("Cancelled", classes="turn-status", markup=False))

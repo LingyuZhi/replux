@@ -116,6 +116,40 @@ def thinking_events(
     return events
 
 
+def tool_use_events(
+    arguments: tuple[str, ...] = ('{"path": ', '"notes.txt"}'), *,
+    name: str = "read_file", call_id: str = "toolu_read", stop_reason: str = "tool_use",
+) -> list[dict[str, Any]]:
+    """An Anthropic response with Thinking, text, and one tool_use whose arguments arrive in pieces."""
+    start = reply_events()[0]
+    return [
+        start,
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "先看文件"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "tool-signature+/="}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "我先读文件。"}},
+        {"type": "content_block_stop", "index": 1},
+        {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}}},
+        *[
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": piece}}
+            for piece in arguments
+        ],
+        {"type": "content_block_stop", "index": 2},
+        {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": 20}},
+        {"type": "message_stop"},
+    ]
+
+
+def native_tool_use(arguments: dict[str, Any], *, name: str = "read_file", call_id: str = "toolu_read") -> dict[str, Any]:
+    return {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "先看文件", "signature": "tool-signature+/="},
+        {"type": "text", "text": "我先读文件。"},
+        {"type": "tool_use", "id": call_id, "name": name, "input": arguments},
+    ]}
+
+
 def unfinished_events(protocol: str, ending: str) -> list[dict[str, Any]]:
     events = reply_events(protocol)
     if ending == "eof":
@@ -123,13 +157,8 @@ def unfinished_events(protocol: str, ending: str) -> list[dict[str, Any]]:
     if ending == "content_end":
         return events[:5] if protocol == "anthropic" else events[:8]
     if protocol == "anthropic":
-        reasons = {"output_limit": "max_tokens", "incomplete": "pause_turn", "tool_request": "tool_use", "tool_terminal": "tool_use"}
+        reasons = {"output_limit": "max_tokens", "incomplete": "pause_turn", "tool_terminal": "tool_use"}
         events[-2]["delta"]["stop_reason"] = reasons[ending]
-        if ending == "tool_request":
-            events[-2:-2] = [
-                {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "tool_offline", "name": "unavailable", "input": {}}},
-                {"type": "content_block_stop", "index": 1},
-            ]
     elif ending in {"tool_request", "tool_terminal"}:
         tool = {"id": "fc_offline", "type": "function_call", "call_id": "call_offline", "name": "unavailable", "arguments": "{}", "status": "completed"}
         events[-1]["response"]["output"].append(tool)

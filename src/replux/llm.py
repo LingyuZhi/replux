@@ -2,20 +2,24 @@
 
 from abc import ABC, abstractmethod
 import asyncio
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass
+import json
+from pathlib import Path
+import time
 from types import TracebackType
 from typing import Generic, Self, TypeVar, cast
 
 from anthropic import APIConnectionError, APIError, APITimeoutError, AsyncAnthropic, DefaultAsyncHttpxClient, NOT_GIVEN, omit
-from anthropic.types import ContentBlock, MessageParam
+from anthropic.types import ContentBlock, MessageParam, ToolParam
 import httpx2 as httpx
 import openai
 from openai.types.responses import Response
 from openai.types.responses.response_input_param import ResponseInputItemParam
 
 from replux.config import DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS, ProviderConfig
+from replux.tools import ToolDefinition, ToolRegistry, ToolResult, create_default_registry, summarize_arguments
 
 
 @dataclass(frozen=True)
@@ -29,6 +33,24 @@ class ThinkingDelta:
 
 
 @dataclass(frozen=True)
+class ToolStarted:
+    call_id: str
+    name: str
+    summary: str
+
+
+@dataclass(frozen=True)
+class ToolFinished:
+    """A Tool Call has its final Tool Result; skipped calls never ran and have no duration."""
+
+    call_id: str
+    name: str
+    summary: str
+    result: ToolResult
+    duration_seconds: float | None
+
+
+@dataclass(frozen=True)
 class ReplyCompleted:
     """The final Reply is complete and committed, so the Turn is complete."""
 
@@ -37,9 +59,18 @@ class ReplyCompleted:
     output_tokens: int | None
 
 
-StreamEvent = TextDelta | ThinkingDelta | ReplyCompleted
+StreamEvent = TextDelta | ThinkingDelta | ToolStarted | ToolFinished | ReplyCompleted
 
 ContextItem = TypeVar("ContextItem")
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """One Tool Call from a model response, with its raw JSON arguments."""
+
+    id: str
+    name: str
+    arguments: str
 
 
 @dataclass(frozen=True)
@@ -50,6 +81,7 @@ class ModelResponse(Generic[ContextItem]):
     stop_reason: str
     input_tokens: int | None
     output_tokens: int | None
+    tool_calls: tuple[ToolCall, ...] = ()
 
 
 ResponseEvent = TextDelta | ThinkingDelta | ModelResponse[ContextItem]
@@ -83,6 +115,10 @@ class NetworkError(LLMError):
 
 class IncompleteReplyError(LLMError):
     """The stream ended without a supported, complete reply."""
+
+
+class ToolBatchLimitError(LLMError):
+    """The Turn stopped because the model requested tools after its Tool Batch limit."""
 
 
 def _request_error(
@@ -189,8 +225,17 @@ class ProtocolAdapter(ABC, Generic[ContextItem]):
         """Return the native context item for one user input."""
 
     @abstractmethod
-    def stream_response(self, context: list[ContextItem]) -> AsyncGenerator[ResponseEvent[ContextItem], None]:
-        """Yield deltas, then ModelResponse last, only after the stream is complete and closed."""
+    def stream_response(
+        self, context: list[ContextItem], tools: Sequence[ToolDefinition], *, tools_allowed: bool,
+    ) -> AsyncGenerator[ResponseEvent[ContextItem], None]:
+        """Yield deltas, then ModelResponse last, only after the stream is complete and closed.
+
+        Tool definitions stay in every request; tools_allowed controls whether the model may call them.
+        """
+
+    @abstractmethod
+    def tool_results(self, results: Sequence[tuple[ToolCall, ToolResult]]) -> list[ContextItem]:
+        """Return native context items that pair each Tool Result with its Tool Call."""
 
     @abstractmethod
     async def aclose(self) -> None:
@@ -198,10 +243,14 @@ class ProtocolAdapter(ABC, Generic[ContextItem]):
 
 
 class Conversation(LLMClient, Generic[ContextItem]):
-    """Run Turns and keep the Conversation Context of completed Turns."""
+    """Run Turns and keep the Conversation Context.
 
-    def __init__(self, adapter: ProtocolAdapter[ContextItem]) -> None:
+    A Turn may run one Tool Batch, then requests a summary with tools disabled.
+    """
+
+    def __init__(self, adapter: ProtocolAdapter[ContextItem], tools: ToolRegistry) -> None:
         self._adapter = adapter
+        self._tools = tools
         self._active = False
         self._context: list[ContextItem] = []
 
@@ -210,21 +259,69 @@ class Conversation(LLMClient, Generic[ContextItem]):
             raise RuntimeError("A reply is already in progress.")
         self._active = True
         try:
-            user_message = self._adapter.user_message(user_input)
-            response: ModelResponse[ContextItem] | None = None
-            async with aclosing(self._adapter.stream_response([*self._context, user_message])) as events:
-                async for event in events:
-                    assert response is None
-                    if isinstance(event, ModelResponse):
-                        response = event
-                    else:
-                        yield event
-            assert response is not None
-            # No await between committing both sides of the Turn and publishing success.
-            self._context.extend([user_message, *response.context_items])
-            yield ReplyCompleted(response.stop_reason, response.input_tokens, response.output_tokens)
+            uncommitted = [self._adapter.user_message(user_input)]
+            tools_allowed = True
+            while True:
+                response: ModelResponse[ContextItem] | None = None
+                request = self._adapter.stream_response(
+                    [*self._context, *uncommitted], self._tools.definitions(), tools_allowed=tools_allowed,
+                )
+                async with aclosing(request) as events:
+                    async for event in events:
+                        assert response is None
+                        if isinstance(event, ModelResponse):
+                            response = event
+                        else:
+                            yield event
+                assert response is not None
+                if not response.tool_calls:
+                    # No await between committing the Turn and publishing success.
+                    self._context.extend([*uncommitted, *response.context_items])
+                    yield ReplyCompleted(response.stop_reason, response.input_tokens, response.output_tokens)
+                    return
+                if not tools_allowed:
+                    raise ToolBatchLimitError("Turn stopped: the model requested more tools after this Turn's tool batch.")
+                ids = [call.id for call in response.tool_calls]
+                if not all(ids) or len(set(ids)) != len(ids):
+                    raise IncompleteReplyError("Reply incomplete: tool calls have missing or duplicate IDs.")
+                uncommitted.extend(response.context_items)
+                results: list[tuple[ToolCall, ToolResult]] = []
+                try:
+                    async with aclosing(self._run_batch(response.tool_calls, results)) as batch:
+                        async for tool_event in batch:
+                            yield tool_event
+                except (asyncio.CancelledError, GeneratorExit):
+                    # Started tool work stays in the Context even when the Turn ends early.
+                    for call in response.tool_calls[len(results):]:
+                        results.append((call, ToolResult("skipped", "Not run because the user cancelled the Turn.")))
+                    self._context.extend([*uncommitted, *self._adapter.tool_results(results)])
+                    raise
+                self._context.extend([*uncommitted, *self._adapter.tool_results(results)])
+                uncommitted = []
+                tools_allowed = False
         finally:
             self._active = False
+
+    async def _run_batch(
+        self, calls: Sequence[ToolCall], results: list[tuple[ToolCall, ToolResult]],
+    ) -> AsyncGenerator[StreamEvent, None]:
+        """Run calls in order, appending each result; stop after the first unsuccessful one."""
+        for call in calls:
+            summary = summarize_arguments(call.arguments)
+            if results and results[-1][1].status != "success":
+                result = ToolResult("skipped", "Not run because an earlier tool call in this batch did not succeed.")
+                results.append((call, result))
+                yield ToolFinished(call.id, call.name, summary, result, None)
+                continue
+            yield ToolStarted(call.id, call.name, summary)
+            started = time.monotonic()
+            try:
+                result = await self._tools.execute(call.name, call.arguments)
+            except asyncio.CancelledError:
+                results.append((call, ToolResult("cancelled", "Cancelled by the user before the tool call finished.")))
+                raise
+            results.append((call, result))
+            yield ToolFinished(call.id, call.name, summary, result, time.monotonic() - started)
 
     async def aclose(self) -> None:
         await self._adapter.aclose()
@@ -248,20 +345,28 @@ class AnthropicAdapter(ProtocolAdapter[MessageParam]):
     def user_message(self, user_input: str) -> MessageParam:
         return {"role": "user", "content": user_input}
 
-    async def stream_response(self, context: list[MessageParam]) -> AsyncGenerator[ResponseEvent[MessageParam], None]:
+    async def stream_response(
+        self, context: list[MessageParam], tools: Sequence[ToolDefinition], *, tools_allowed: bool,
+    ) -> AsyncGenerator[ResponseEvent[MessageParam], None]:
         try:
             content: list[ContentBlock] = []
+            arguments: dict[int, list[str]] = {}
             input_tokens: int | None = None
             output_tokens: int | None = None
             stop_reason: str | None = None
             started = False
             stopped = False
+            definitions: list[ToolParam] = [
+                {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema} for tool in tools
+            ]
             async with await self._sdk.messages.create(
                 model=self._config.model,
                 max_tokens=self._config.max_output_tokens or DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS,
                 messages=context,
                 thinking=self._config.thinking if self._config.thinking is not None else omit,
                 output_config={"effort": self._config.thinking_effort} if self._config.thinking_effort is not None else omit,
+                tools=definitions or omit,
+                tool_choice={"type": "none"} if definitions and not tools_allowed else omit,
                 stream=True,
             ) as stream:
                 async for event in stream:
@@ -282,14 +387,19 @@ class AnthropicAdapter(ProtocolAdapter[MessageParam]):
                         elif event.delta.type == "citations_delta":
                             assert block.type == "text"
                             block.citations = [*(block.citations or []), event.delta.citation]
+                        elif event.delta.type == "input_json_delta":
+                            assert block.type == "tool_use"
+                            arguments[event.index].append(event.delta.partial_json)
                     elif event.type == "message_start":
                         started = True
                         content = list(event.message.content)
                         usage = getattr(event.message, "usage", None)
                         input_tokens = getattr(usage, "input_tokens", None)
                     elif event.type == "content_block_start":
-                        if event.content_block.type in {"tool_use", "server_tool_use"}:
-                            raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
+                        if event.content_block.type == "server_tool_use":
+                            raise IncompleteReplyError("Reply incomplete: server tool requests are not supported.")
+                        if event.content_block.type == "tool_use":
+                            arguments[event.index] = []
                         content.append(event.content_block)
                     elif event.type == "message_delta":
                         if event.delta.stop_reason is not None:
@@ -304,14 +414,35 @@ class AnthropicAdapter(ProtocolAdapter[MessageParam]):
             _raise_if_cancelled()
             if not started or not stopped or stop_reason is None:
                 raise IncompleteReplyError("Reply incomplete: the final completion signal is missing.")
-            if stop_reason == "tool_use":
-                raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
-            if stop_reason not in {"end_turn", "stop_sequence", "refusal"}:
+            if stop_reason not in {"end_turn", "stop_sequence", "refusal", "tool_use"}:
                 raise IncompleteReplyError("Reply incomplete: the output limit was reached or the stop reason is not supported.")
-            yield ModelResponse(({"role": "assistant", "content": content},), stop_reason, input_tokens, output_tokens)
+            if (stop_reason == "tool_use") != bool(arguments):
+                raise IncompleteReplyError("Reply incomplete: the tool request is incomplete.")
+            calls: list[ToolCall] = []
+            for index, pieces in arguments.items():
+                block = content[index]
+                assert block.type == "tool_use"
+                raw = "".join(pieces) or json.dumps(block.input)
+                try:
+                    block.input = json.loads(raw)
+                except json.JSONDecodeError:
+                    raise IncompleteReplyError("Reply incomplete: tool call arguments are not valid JSON.") from None
+                if not isinstance(block.input, dict):
+                    raise IncompleteReplyError("Reply incomplete: tool call arguments are not a JSON object.")
+                calls.append(ToolCall(block.id, block.name, raw))
+            yield ModelResponse(
+                ({"role": "assistant", "content": content},), stop_reason, input_tokens, output_tokens, tuple(calls),
+            )
         except (APIError, httpx.HTTPError) as error:
             _raise_if_cancelled()
             raise _request_error(error, thinking=self._config.thinking is not None or self._config.thinking_effort is not None) from error
+
+    def tool_results(self, results: Sequence[tuple[ToolCall, ToolResult]]) -> list[MessageParam]:
+        # The status inside the JSON text is authoritative; is_error only marks non-success for the API.
+        return [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": call.id, "content": result.to_json(), "is_error": result.status != "success"}
+            for call, result in results
+        ]}]
 
     async def aclose(self) -> None:
         await self._sdk.close()
@@ -336,8 +467,10 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
         return {"role": "user", "content": user_input}
 
     async def stream_response(
-        self, context: list[ResponseInputItemParam],
+        self, context: list[ResponseInputItemParam], tools: Sequence[ToolDefinition], *, tools_allowed: bool,
     ) -> AsyncGenerator[ResponseEvent[ResponseInputItemParam], None]:
+        if tools:
+            raise NotImplementedError("Responses tool definitions are not supported yet.")
         try:
             final: Response | None = None
             async with await self._sdk.responses.create(
@@ -388,6 +521,9 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
             _raise_if_cancelled()
             raise _request_error(error, thinking=self._config.thinking_effort is not None) from error
 
+    def tool_results(self, results: Sequence[tuple[ToolCall, ToolResult]]) -> list[ResponseInputItemParam]:
+        raise NotImplementedError("Responses tool results are not supported yet.")
+
     async def aclose(self) -> None:
         await self._sdk.close()
 
@@ -395,8 +531,9 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
 def create_client(
     config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
 ) -> LLMClient:
+    """Assemble a Conversation; relative tool paths start at the current (startup) directory."""
     if config.protocol == "anthropic":
-        return Conversation(AnthropicAdapter(config, transport=transport))
+        return Conversation(AnthropicAdapter(config, transport=transport), create_default_registry(Path.cwd()))
     if config.protocol == "openai":
-        return Conversation(OpenAIAdapter(config, transport=transport))
+        return Conversation(OpenAIAdapter(config, transport=transport), ToolRegistry())
     raise ValueError("Unsupported protocol; expected anthropic or openai.")

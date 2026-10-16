@@ -2,6 +2,7 @@ import asyncio
 from contextlib import aclosing
 from dataclasses import replace
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ import httpx2 as httpx
 import openai
 
 from replux.llm import LLMClient, LLMError, ReplyCompleted, TextDelta, create_client
+from replux.tools import create_default_registry
 from tests.support import ControlledSSE, RecordingTransport, provider_config, reply_events
 
 
@@ -115,6 +117,10 @@ async def test_text_arrives_before_completion_and_completion_waits_for_cleanup(
         assert json.loads(request.content) == {
             "model": "custom-model-20261001", "max_tokens": 128000,
             "messages": [{"role": "user", "content": "  你好，Replux  "}], "stream": True,
+            "tools": [
+                {"name": tool.name, "description": tool.description, "input_schema": tool.input_schema}
+                for tool in create_default_registry(Path.cwd()).definitions()
+            ],
         }
     else:
         assert str(request.url) == "https://gateway.example/anthropic/v2/responses"
@@ -188,7 +194,7 @@ async def test_usage_is_final_cumulative_data_with_missing_values_unknown(
 
 
 @pytest.mark.parametrize(
-    "failure", ["eof", "block_stop", "missing_start", "missing_reason", "max_tokens", "tool_use", "pause_turn", "tool_block"]
+    "failure", ["eof", "block_stop", "missing_start", "missing_reason", "max_tokens", "tool_use", "pause_turn", "server_tool"]
 )
 async def test_incomplete_or_unsupported_response_never_publishes_completion(failure: str) -> None:
     events = reply_events()
@@ -198,8 +204,8 @@ async def test_incomplete_or_unsupported_response_never_publishes_completion(fai
         events = events[:5]
     elif failure == "missing_start":
         events.pop(0)
-    elif failure == "tool_block":
-        events[1]["content_block"] = {"type": "tool_use", "id": "tool_1", "name": "unavailable", "input": {}}
+    elif failure == "server_tool":
+        events[1]["content_block"] = {"type": "server_tool_use", "id": "srvtoolu_1", "name": "web_search", "input": {}}
     else:
         events[5]["delta"]["stop_reason"] = None if failure == "missing_reason" else failure
     stream = ControlledSSE(events)

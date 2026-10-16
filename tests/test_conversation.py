@@ -23,7 +23,7 @@ async def test_next_request_replays_each_completed_turn(protocol: str, refusal: 
             request = json.loads(transport.requests[-1].content)
             assert request[field] == expected
             assert set(request) == (
-                {"model", "messages", "max_tokens", "stream"} if protocol == "anthropic"
+                {"model", "messages", "max_tokens", "tools", "stream"} if protocol == "anthropic"
                 else {"model", "input", "stream", "store"}
             )
             stop_reason = ("refusal" if refusal else "end_turn") if protocol == "anthropic" else "completed"
@@ -112,8 +112,10 @@ async def test_abandoned_reply_closes_stream_and_stays_out_of_next_request(proto
     assert transport.closed
 
 
-@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
-@pytest.mark.parametrize("ending", ["eof", "content_end", "output_limit", "incomplete", "tool_request", "tool_terminal"])
+@pytest.mark.parametrize(("protocol", "ending"), [
+    *[(protocol, ending) for protocol in ["anthropic", "openai"] for ending in ["eof", "content_end", "output_limit", "incomplete"]],
+    ("anthropic", "tool_terminal"), ("openai", "tool_request"), ("openai", "tool_terminal"),
+])
 async def test_unfinished_turn_preserves_previously_completed_history(protocol: str, ending: str) -> None:
     streams = [
         ControlledSSE(reply_events(protocol)),
@@ -128,7 +130,8 @@ async def test_unfinished_turn_preserves_previously_completed_history(protocol: 
             async for event in client.stream_reply("unfinished"):
                 received.append(event)
         if ending.startswith("tool_"):
-            assert "tool requests are not supported" in str(caught.value)
+            expected = "tool request is incomplete" if protocol == "anthropic" else "tool requests are not supported"
+            assert expected in str(caught.value)
         assert received == [TextDelta("你好"), TextDelta("，世界\n")]
         _ = [event async for event in client.stream_reply("follow-up")]
     field = "messages" if protocol == "anthropic" else "input"
