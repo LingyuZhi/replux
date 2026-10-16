@@ -7,14 +7,14 @@ from dataclasses import dataclass
 from types import TracebackType
 from typing import Self, cast
 
-from anthropic import APIConnectionError, APIError, APITimeoutError, AsyncAnthropic, DefaultAsyncHttpxClient, omit
+from anthropic import APIConnectionError, APIError, APITimeoutError, AsyncAnthropic, DefaultAsyncHttpxClient, NOT_GIVEN, omit
 from anthropic.types import ContentBlock, MessageParam
 import httpx2 as httpx
 import openai
 from openai.types.responses import Response, ResponseInputParam
 from openai.types.responses.response_input_param import ResponseInputItemParam
 
-from replux.config import ProviderConfig
+from replux.config import DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS, ProviderConfig
 
 
 @dataclass(frozen=True)
@@ -173,7 +173,7 @@ class AnthropicClient(LLMClient):
         self._sdk = AsyncAnthropic(
             api_key=config.api_key,
             base_url=config.base_url,
-            timeout=config.timeout_seconds,
+            timeout=config.timeout_seconds if config.timeout_seconds is not None else NOT_GIVEN,
             max_retries=0,
             http_client=DefaultAsyncHttpxClient(
                 transport=transport, event_hooks={"response": [_protect_response_cleanup]},
@@ -194,9 +194,10 @@ class AnthropicClient(LLMClient):
             stopped = False
             async with await self._sdk.messages.create(
                 model=self._config.model,
-                max_tokens=self._config.max_output_tokens,
+                max_tokens=self._config.max_output_tokens or DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS,
                 messages=[*self._history, user_message],
                 thinking=self._config.thinking if self._config.thinking is not None else omit,
+                output_config={"effort": self._config.thinking_effort} if self._config.thinking_effort is not None else omit,
                 stream=True,
             ) as stream:
                 async for event in stream:
@@ -248,7 +249,7 @@ class AnthropicClient(LLMClient):
             yield ReplyCompleted(stop_reason, input_tokens, output_tokens)
         except (APIError, httpx.HTTPError) as error:
             _raise_if_cancelled()
-            raise _request_error(error, thinking=self._config.thinking is not None) from error
+            raise _request_error(error, thinking=self._config.thinking is not None or self._config.thinking_effort is not None) from error
         finally:
             self._active = False
 
@@ -266,7 +267,7 @@ class OpenAIClient(LLMClient):
         self._sdk = openai.AsyncOpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
-            timeout=config.timeout_seconds,
+            timeout=config.timeout_seconds if config.timeout_seconds is not None else openai.NOT_GIVEN,
             max_retries=0,
             http_client=openai.DefaultAsyncHttpxClient(
                 transport=transport, event_hooks={"response": [_protect_response_cleanup]},
@@ -282,7 +283,8 @@ class OpenAIClient(LLMClient):
             final: Response | None = None
             async with await self._sdk.responses.create(
                 model=self._config.model,
-                max_output_tokens=self._config.max_output_tokens,
+                max_output_tokens=self._config.max_output_tokens if self._config.max_output_tokens is not None else openai.omit,
+                reasoning={"effort": self._config.thinking_effort} if self._config.thinking_effort is not None else openai.omit,
                 input=[*self._history, user_message],
                 store=False,
                 stream=True,
@@ -326,7 +328,7 @@ class OpenAIClient(LLMClient):
             )
         except (openai.APIError, httpx.HTTPError) as error:
             _raise_if_cancelled()
-            raise _request_error(error) from error
+            raise _request_error(error, thinking=self._config.thinking_effort is not None) from error
         finally:
             self._active = False
 

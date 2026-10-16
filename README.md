@@ -10,15 +10,24 @@ uv sync --dev
 ```
 
 创建 `~/.replux/config.yaml`（目录不存在时先创建 `~/.replux/`），填写完整模型名与密钥。
-四个必填字段是 `protocol`、`model`、`base_url` 和 `api_key`：
+`providers` 中只启用一项，其余配置整块注释。`name` 是便于识别的名称；
+`protocol` 选择 `anthropic`（Messages）或 `openai`（Responses）：
 
 ```yaml
-protocol: anthropic
-model: your-full-model-id
-base_url: https://api.anthropic.com
-api_key: your-api-key
-max_output_tokens: 8192
-timeout_seconds: 120
+providers:
+  - name: anthropic-official
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    api_key: your-api-key
+    model: claude-opus-5-5
+    thinking: auto
+
+  # - name: openai-official
+  #   protocol: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key: your-openai-api-key
+  #   model: your-full-openai-model-id
+  #   thinking: auto
 ```
 
 保存配置后启动：
@@ -27,34 +36,16 @@ timeout_seconds: 120
 uv run replux
 ```
 
-Anthropic 可按模型支持情况添加 `thinking`。省略时保持模型默认行为。
-例如，显式使用 adaptive 并请求可展示摘要：
-
-```yaml
-thinking:
-  type: adaptive
-  display: summarized
-```
-
-手动模式可写为 `thinking: {type: enabled, budget_tokens: 1024}`。
-预算必须至少为 `1024`，且小于 `max_output_tokens`；也可添加 `display: summarized`。
-显式关闭使用 `thinking: {type: disabled}`，不能携带预算或展示参数。
-模型拒绝配置时会报错，不自动更换模式或重试。
+`thinking` 可选 `auto`、`low`、`medium`、`high`、`xhigh` 或 `max`。
+`auto`（也可省略）沿用服务端默认行为；其他值只设置推理强度，不指定 token 预算。
+不同模型支持的档位与默认值可能不同。模型拒绝配置时会报错，不自动更换档位或重试。
+思考模式和可见摘要遵循服务端默认设置；配置强度不保证返回可展示的思考内容。
 
 API 返回可展示思考内容后，每轮显示默认折叠的 `+ Thinking`。
 点击 `+` 展开、点击 `-` 收起；用 `Tab` 移动焦点后，也可按 `Enter` 切换。
 展开后继续显示新增内容。显示操作不改变请求；没有可展示内容时不出现控件。
 
-使用 OpenAI Responses 时，将配置改为：
-
-```yaml
-protocol: openai
-model: your-full-openai-model-id
-base_url: https://api.openai.com/v1
-api_key: your-api-key
-```
-
-OpenAI 请求使用 `store: false`。OpenAI 配置不接受 Anthropic 专用的 `thinking` 字段。
+使用另一项配置时，先注释当前项，再取消另一项的注释。OpenAI 请求使用 `store: false`。
 
 也可以指定另一份配置，或通过 Python 模块启动：
 
@@ -65,9 +56,10 @@ uv run python -m replux --config /path/to/config.yaml
 
 每次启动仅读取一份配置，修改后需重启。`api_key` 按字面读取；
 `base_url` 直接交给 SDK，兼容端点需填写其要求的根地址。
-`max_output_tokens` 和 `timeout_seconds` 可省略，默认分别为 `8192` 和 `120` 秒。
-`timeout_seconds` 控制网络 I/O 等待时间，不是整轮生成的总时限。
-请求自动重试已关闭。
+输出与超时由应用处理：Anthropic 的单次输出上限为 `128000` tokens，包含思考与正文；
+这是面向前沿模型的应用上限，模型必须支持此值。OpenAI 沿用服务端输出默认值。
+网络 I/O 等待采用 SDK 默认值：连接为 5 秒，其余为 600 秒，不是整轮生成的总时限。
+请求自动重试已关闭。旧版平铺配置仍可读取。
 
 在底部输入问题，按 `Enter` 发送，按 `Ctrl+J` 换行。可粘贴中文多行内容，保留换行与缩进；纯空白不会发送。
 回复按纯文本显示。停留在底部时跟随新内容；向上滚动查看旧记录时保持位置，回到底部后恢复跟随。

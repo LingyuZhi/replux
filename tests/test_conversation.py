@@ -24,7 +24,7 @@ async def test_next_request_replays_each_completed_turn(protocol: str, refusal: 
             assert request[field] == expected
             assert set(request) == (
                 {"model", "messages", "max_tokens", "stream"} if protocol == "anthropic"
-                else {"model", "input", "max_output_tokens", "stream", "store"}
+                else {"model", "input", "stream", "store"}
             )
             stop_reason = ("refusal" if refusal else "end_turn") if protocol == "anthropic" else "completed"
             chunks = ["抱歉，", "无法回答。\n"] if refusal else ["你好", "，世界\n"]

@@ -4,11 +4,15 @@ from collections.abc import Hashable
 from dataclasses import dataclass, field
 import math
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from urllib.parse import urlsplit
 
 from anthropic.types import ThinkingConfigParam
 import yaml
+
+
+DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS = 128_000
+ThinkingEffort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
 class ConfigError(ValueError):
@@ -42,9 +46,11 @@ class ProviderConfig:
     model: str
     base_url: str
     api_key: str = field(repr=False)
-    max_output_tokens: int = 8192
-    timeout_seconds: float = 120
+    max_output_tokens: int | None = None
+    timeout_seconds: float | None = None
     thinking: ThinkingConfigParam | None = None
+    thinking_effort: ThinkingEffort | None = None
+    name: str | None = None
 
 
 def load_config(path: Path | None = None) -> ProviderConfig:
@@ -62,11 +68,22 @@ def load_config(path: Path | None = None) -> ProviderConfig:
 
     if not isinstance(values, dict):
         raise ConfigError("Configuration must be a YAML mapping.")
-    if values.get("protocol") == "openai" and "thinking" in values:
-        raise ConfigError("OpenAI configuration does not support the Anthropic-only thinking field.")
+    name = None
+    if "providers" in values:
+        if values.keys() != {"providers"}:
+            raise ConfigError("Only providers is supported at the top level.")
+        providers = values["providers"]
+        if not isinstance(providers, list) or len(providers) != 1:
+            raise ConfigError("Exactly one provider must be active. Comment out the unused providers.")
+        values = providers[0]
+        if not isinstance(values, dict):
+            raise ConfigError("Each provider must be a YAML mapping.")
+        name = _required_string(values, "name")
     allowed = {"protocol", "model", "base_url", "api_key", "max_output_tokens", "timeout_seconds", "thinking"}
+    if name is not None:
+        allowed = {"name", "protocol", "model", "base_url", "api_key", "thinking"}
     if values.keys() - allowed:
-        raise ConfigError("Configuration contains unknown fields. Supported fields: protocol, model, base_url, api_key, max_output_tokens, timeout_seconds, thinking.")
+        raise ConfigError(f"Configuration contains unknown fields. Supported fields: {', '.join(sorted(allowed))}.")
 
     protocol = _required_string(values, "protocol")
     if protocol not in {"anthropic", "openai"}:
@@ -92,21 +109,35 @@ def load_config(path: Path | None = None) -> ProviderConfig:
     if not valid_url:
         raise ConfigError("base_url must be a valid HTTP(S) base URL.")
 
-    max_tokens = values.get("max_output_tokens", ProviderConfig.max_output_tokens)
-    if type(max_tokens) is not int or max_tokens <= 0:
+    max_tokens = values.get("max_output_tokens")
+    if "max_output_tokens" in values and (type(max_tokens) is not int or max_tokens <= 0):
         raise ConfigError("max_output_tokens must be a positive integer.")
-    timeout = values.get("timeout_seconds", ProviderConfig.timeout_seconds)
-    if type(timeout) not in {int, float}:
-        raise ConfigError("timeout_seconds must be a finite positive number.")
-    try:
-        timeout = float(timeout)
-    except OverflowError:
-        raise ConfigError("timeout_seconds must be a finite positive number.") from None
-    if not math.isfinite(timeout) or timeout <= 0:
-        raise ConfigError("timeout_seconds must be a finite positive number.")
+    timeout = values.get("timeout_seconds")
+    if "timeout_seconds" in values:
+        if type(timeout) not in {int, float}:
+            raise ConfigError("timeout_seconds must be a finite positive number.")
+        try:
+            timeout = float(cast(int | float, timeout))
+        except OverflowError:
+            raise ConfigError("timeout_seconds must be a finite positive number.") from None
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ConfigError("timeout_seconds must be a finite positive number.")
 
-    thinking = _thinking_config(values["thinking"], max_tokens) if "thinking" in values else None
-    return ProviderConfig(protocol, model, base_url, api_key, max_tokens, timeout, thinking)
+    thinking = None
+    effort = None
+    if "thinking" in values:
+        value = values["thinking"]
+        if isinstance(value, str):
+            if value not in {"auto", "low", "medium", "high", "xhigh", "max"}:
+                raise ConfigError("thinking must be auto, low, medium, high, xhigh, or max.")
+            effort = cast(ThinkingEffort, value) if value != "auto" else None
+        else:
+            if name is not None:
+                raise ConfigError("thinking must be auto, low, medium, high, xhigh, or max.")
+            if protocol == "openai":
+                raise ConfigError("OpenAI thinking must be auto, low, medium, high, xhigh, or max; Anthropic configuration mappings are not supported.")
+            thinking = _thinking_config(value, max_tokens or DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS)
+    return ProviderConfig(protocol, model, base_url, api_key, max_tokens, timeout, thinking, effort, name)
 
 
 def _thinking_config(value: object, max_tokens: int) -> ThinkingConfigParam:

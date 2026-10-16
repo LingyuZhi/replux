@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncGenerator
+from importlib.metadata import version
 import json
 from pathlib import Path
 import subprocess
@@ -41,7 +42,7 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
             self.closed = True
 
     client = ScriptedClient()
-    app = RepluxApp(client)
+    app = RepluxApp(client, model="scripted-model")
     async with app.run_test(size=(80, 24)) as pilot:
         prompt = app.query_one("#prompt", TextArea)
         prompt.text = "first"
@@ -139,7 +140,7 @@ async def test_streaming_follows_bottom_and_preserves_old_transcript_while_editi
             pass
 
     client = ScriptedClient()
-    app = RepluxApp(client)
+    app = RepluxApp(client, model="scripted-model")
     async with app.run_test(size=(80, 24)) as pilot:
         prompt = app.query_one("#prompt", TextArea)
         transcript = app.query_one("#transcript", VerticalScroll)
@@ -386,6 +387,11 @@ async def test_selected_yaml_controls_actual_request_until_restart(
     selected.write_text("protocol: changed-after-startup\n", encoding="utf-8")
 
     async with app.run_test() as pilot:
+        assert app.query_one("#startup-model", Static).content == "selected-full-model-id"
+        assert f"v{version('replux')}" in app.export_screenshot()
+        assert app.query_one("#startup-directory", Static).content == str(Path.cwd())
+        assert app.query_one("#startup").region.y == app.query_one("#transcript").content_region.y
+        assert not transport.requests
         app.query_one("#prompt", TextArea).text = "one question"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -425,7 +431,7 @@ async def test_tui_accepts_a_scripted_llm_client_and_preserves_input() -> None:
             self.closed = True
 
     client = ScriptedClient()
-    app = RepluxApp(client)
+    app = RepluxApp(client, model="scripted-model")
     async with app.run_test() as pilot:
         await pilot.press("space", "ctrl+j", "space", "enter")
         assert client.inputs == []
@@ -460,7 +466,7 @@ async def test_batched_typing_newline_paste_and_enter_keep_their_order() -> None
             pass
 
     client = ScriptedClient()
-    app = RepluxApp(client)
+    app = RepluxApp(client, model="scripted-model")
     async with app.run_test() as pilot:
         for event in [Key("a", "a"), Key("ctrl+j", "\n"), Paste("  b\n\tc\n"), Key("enter", "\r")]:
             app.post_message(event)
@@ -537,7 +543,7 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
     pending.release_close.clear()
     streams = [ControlledSSE(reply_events(protocol)), pending, ControlledSSE(reply_events(protocol))]
     transport = RecordingTransport(streams)
-    app = RepluxApp(create_client(provider_config(protocol), transport=transport))
+    app = RepluxApp(create_client(provider_config(protocol), transport=transport), model=provider_config(protocol).model)
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", TextArea)
         prompt.text = "first"
@@ -625,7 +631,7 @@ async def test_programming_error_terminates_chat_and_releases_resources(protocol
     events = reply_events(protocol)
     stream = ControlledSSE(events[:3 if protocol == "anthropic" else 5], read_error=RuntimeError("injected defect"))
     transport = RecordingTransport(stream)
-    app = RepluxApp(create_client(provider_config(protocol), transport=transport))
+    app = RepluxApp(create_client(provider_config(protocol), transport=transport), model=provider_config(protocol).model)
     with pytest.raises(WorkerFailed, match="injected defect"):
         async with app.run_test() as pilot:
             app.query_one("#prompt", TextArea).text = "hello"
@@ -660,7 +666,7 @@ async def session():
     protocol = sys.argv[1]
     stream = ControlledSSE(reply_events(protocol), gate_after=0)
     transport = RecordingTransport(stream)
-    app = ExitOnSubmitApp(create_client(provider_config(protocol), transport=transport))
+    app = ExitOnSubmitApp(create_client(provider_config(protocol), transport=transport), model=provider_config(protocol).model)
     async with app.run_test() as pilot:
         app.query_one('#prompt', TextArea).text = 'hello'
         await pilot.press('enter')

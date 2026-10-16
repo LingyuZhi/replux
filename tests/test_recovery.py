@@ -205,7 +205,7 @@ async def test_partial_failure_keeps_visible_text_and_draft_then_uses_only_compl
     )
     streams = [ControlledSSE(reply_events(protocol)), pending, ControlledSSE(reply_events(protocol))]
     transport = RecordingTransport(streams)
-    app = RepluxApp(create_client(config, transport=transport))
+    app = RepluxApp(create_client(config, transport=transport), model=config.model)
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", TextArea)
         prompt.text = "first"
@@ -236,8 +236,10 @@ async def test_partial_failure_keeps_visible_text_and_draft_then_uses_only_compl
         {"role": "user", "content": "first"}, *native_reply(protocol),
         {"role": "user", "content": "follow-up"},
     ]
-    limit = "max_tokens" if protocol == "anthropic" else "max_output_tokens"
-    assert all(json.loads(request.content)[limit] == 8192 for request in transport.requests)
+    if protocol == "anthropic":
+        assert all(json.loads(request.content)["max_tokens"] == 128000 for request in transport.requests)
+    else:
+        assert all("max_output_tokens" not in json.loads(request.content) for request in transport.requests)
     assert all(json.loads(request.content)["model"] == config.model for request in transport.requests)
     assert all(stream.closed for stream in streams)
     assert transport.closed

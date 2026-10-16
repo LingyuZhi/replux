@@ -45,8 +45,33 @@ async def test_rejected_thinking_configuration_is_reported_without_fallback(
     assert len(requests) == 1
     request = json.loads(requests[0].content)
     assert request["thinking"] == thinking
-    assert request["max_tokens"] == 8192
+    assert request["max_tokens"] == 128000
     assert request["model"] == "custom-model-20261001"
+    assert requests[0].headers["x-stainless-retry-count"] == "0"
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_rejected_effort_is_reported_without_changing_the_request(protocol: str) -> None:
+    requests: list[httpx.Request] = []
+
+    def reject(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(400, json={"error": {
+            "type": "invalid_request_error", "message": "unsupported effort; test-secret-never-display",
+        }})
+
+    config = replace(provider_config(protocol), thinking_effort="max")
+    async with create_client(config, transport=httpx.MockTransport(reject)) as client:
+        with pytest.raises(LLMError, match="thinking") as caught:
+            await anext(client.stream_reply("hello"))
+
+    assert caught.value.status_code == 400
+    assert "test-secret-never-display" not in str(caught.value)
+    assert len(requests) == 1
+    body = json.loads(requests[0].content)
+    field = "output_config" if protocol == "anthropic" else "reasoning"
+    assert body[field] == {"effort": "max"}
+    assert body["model"] == config.model
     assert requests[0].headers["x-stainless-retry-count"] == "0"
 
 
@@ -89,19 +114,19 @@ async def test_text_arrives_before_completion_and_completion_waits_for_cleanup(
         assert request.headers["x-api-key"] == "${LITERAL_KEY}"
         assert "authorization" not in request.headers
         assert json.loads(request.content) == {
-            "model": "custom-model-20261001", "max_tokens": 8192,
+            "model": "custom-model-20261001", "max_tokens": 128000,
             "messages": [{"role": "user", "content": "  你好，Replux  "}], "stream": True,
         }
     else:
         assert str(request.url) == "https://gateway.example/anthropic/v2/responses"
         assert request.headers["authorization"] == "Bearer ${LITERAL_KEY}"
         assert json.loads(request.content) == {
-            "model": "custom-model-20261001", "max_output_tokens": 8192,
+            "model": "custom-model-20261001",
             "input": [{"role": "user", "content": "  你好，Replux  "}],
             "stream": True, "store": False,
         }
     assert request.extensions["timeout"] == {
-        "connect": 120, "read": 120, "write": 120, "pool": 120
+        "connect": 5, "read": 600, "write": 600, "pool": 600
     }
 
 
@@ -282,7 +307,7 @@ async def test_openai_replays_complete_output_without_displaying_reasoning() -> 
         *events[-1]["response"]["output"],
         {"role": "user", "content": "follow-up"},
     ]
-    assert set(request) == {"model", "input", "max_output_tokens", "stream", "store"}
+    assert set(request) == {"model", "input", "stream", "store"}
     assert request["store"] is False
     assert stream.closed
     assert follow_up.closed

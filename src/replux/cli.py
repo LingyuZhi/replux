@@ -21,7 +21,7 @@ def create_app(
         config = load_config(args.config)
     except ConfigError as error:
         parser.error(str(error))
-    return RepluxApp(create_client(config, transport=transport))
+    return RepluxApp(create_client(config, transport=transport), model=config.model)
 
 
 def main() -> None:

@@ -2,16 +2,27 @@
 
 import asyncio
 from contextlib import aclosing
+from importlib.metadata import version
+from pathlib import Path
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Key
 from textual.worker import WorkerCancelled
-from textual.widgets import Collapsible, Header, Static, TextArea
+from textual.widgets import Collapsible, Static, TextArea
 
 from replux.llm import IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, TextDelta, ThinkingDelta
+
+
+SPARK_LOGO = "\n".join((
+    "     ▄█▄     ",
+    "  ▄▄█████▄▄  ",
+    "████  █  ████",
+    "  ▀▀█████▀▀  ",
+    "     ▀█▀     ",
+))
 
 
 class Prompt(TextArea):
@@ -34,25 +45,41 @@ class RepluxApp(App[None]):
     #prompt { height: auto; min-height: 3; max-height: 8; }
     #status { height: 1; padding: 0 1; color: $text-muted; }
     #transcript { height: 1fr; padding: 1 2; }
+    #transcript-content { height: auto; min-height: 100%; }
+    #startup { height: 5; margin-bottom: 1; }
+    #startup-logo { width: 13; height: 5; margin-right: 3; color: #c6b8eb; text-wrap: nowrap; }
+    #startup-info { width: 1fr; height: 3; margin-top: 1; }
+    #startup-info Static { height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #startup-model, #startup-directory { color: $text-muted; }
     .user { margin-top: 1; color: $accent; }
     .reply { margin: 1 0; }
     .thinking-content { color: $text-muted; }
     .turn-status { color: $warning; }
     """
 
-    def __init__(self, client: LLMClient) -> None:
+    def __init__(self, client: LLMClient, *, model: str) -> None:
         super().__init__()
         self._client = client
+        self._model = model
         self._generating = False
         self._cancelling = False
         self._reply_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
-        yield Header()
         with Vertical(id="composer"):
             yield Static("Ready", id="status")
             yield Prompt(placeholder="Enter to send, Ctrl+J for a new line", id="prompt")
-        yield VerticalScroll(id="transcript")
+        directory = Path.cwd()
+        home = Path.home()
+        display_directory = str(Path("~") / directory.relative_to(home)) if directory.is_relative_to(home) else str(directory)
+        with VerticalScroll(id="transcript"):
+            with Vertical(id="transcript-content"):
+                with Horizontal(id="startup"):
+                    yield Static(SPARK_LOGO, id="startup-logo", markup=False)
+                    with Vertical(id="startup-info"):
+                        yield Static(f"[bold]Replux[/bold] [dim]v{version('replux')}[/dim]", id="startup-title")
+                        yield Static(self._model, id="startup-model", markup=False)
+                        yield Static(display_directory, id="startup-directory", markup=False)
 
     def on_mount(self) -> None:
         self.query_one("#transcript", VerticalScroll).anchor()
@@ -108,7 +135,7 @@ class RepluxApp(App[None]):
                 self.query_one("#status", Static).update("Ready")
 
     async def _show_reply(self, user_input: str) -> None:
-        transcript = self.query_one("#transcript", VerticalScroll)
+        transcript = self.query_one("#transcript-content", Vertical)
         reply = Static("", classes="reply", markup=False)
         text = ""
         thinking_text = ""
