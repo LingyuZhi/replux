@@ -10,7 +10,7 @@ from anthropic.types import ThinkingConfigParam
 import httpx2 as httpx
 import openai
 
-from replux.llm import AnthropicClient, LLMClient, LLMError, OpenAIClient, ReplyCompleted, TextDelta, create_client
+from replux.llm import LLMClient, LLMError, ReplyCompleted, TextDelta, create_client
 from tests.support import ControlledSSE, RecordingTransport, provider_config, reply_events
 
 
@@ -88,7 +88,6 @@ async def test_text_arrives_before_completion_and_completion_waits_for_cleanup(
     transport = RecordingTransport(stream)
     client = create_client(provider_config(protocol), transport=transport)
     assert isinstance(client, LLMClient)
-    assert isinstance(client, AnthropicClient if protocol == "anthropic" else OpenAIClient)
 
     async with client:
         reply = client.stream_reply("  你好，Replux  ")

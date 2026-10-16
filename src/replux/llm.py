@@ -3,15 +3,16 @@
 from abc import ABC, abstractmethod
 import asyncio
 from collections.abc import AsyncGenerator, AsyncIterator
+from contextlib import aclosing
 from dataclasses import dataclass
 from types import TracebackType
-from typing import Self, cast
+from typing import Generic, Self, TypeVar, cast
 
 from anthropic import APIConnectionError, APIError, APITimeoutError, AsyncAnthropic, DefaultAsyncHttpxClient, NOT_GIVEN, omit
 from anthropic.types import ContentBlock, MessageParam
 import httpx2 as httpx
 import openai
-from openai.types.responses import Response, ResponseInputParam
+from openai.types.responses import Response
 from openai.types.responses.response_input_param import ResponseInputItemParam
 
 from replux.config import DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS, ProviderConfig
@@ -29,12 +30,29 @@ class ThinkingDelta:
 
 @dataclass(frozen=True)
 class ReplyCompleted:
+    """The final Reply is complete and committed, so the Turn is complete."""
+
     stop_reason: str
     input_tokens: int | None
     output_tokens: int | None
 
 
 StreamEvent = TextDelta | ThinkingDelta | ReplyCompleted
+
+ContextItem = TypeVar("ContextItem")
+
+
+@dataclass(frozen=True)
+class ModelResponse(Generic[ContextItem]):
+    """One complete model response, kept in native form for replay."""
+
+    context_items: tuple[ContextItem, ...]
+    stop_reason: str
+    input_tokens: int | None
+    output_tokens: int | None
+
+
+ResponseEvent = TextDelta | ThinkingDelta | ModelResponse[ContextItem]
 
 
 class LLMError(RuntimeError):
@@ -163,13 +181,60 @@ class LLMClient(ABC):
         await self.aclose()
 
 
-class AnthropicClient(LLMClient):
+class ProtocolAdapter(ABC, Generic[ContextItem]):
+    """Make single model requests in one protocol's native context format."""
+
+    @abstractmethod
+    def user_message(self, user_input: str) -> ContextItem:
+        """Return the native context item for one user input."""
+
+    @abstractmethod
+    def stream_response(self, context: list[ContextItem]) -> AsyncGenerator[ResponseEvent[ContextItem], None]:
+        """Yield deltas, then ModelResponse last, only after the stream is complete and closed."""
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Release the adapter's network resources."""
+
+
+class Conversation(LLMClient, Generic[ContextItem]):
+    """Run Turns and keep the Conversation Context of completed Turns."""
+
+    def __init__(self, adapter: ProtocolAdapter[ContextItem]) -> None:
+        self._adapter = adapter
+        self._active = False
+        self._context: list[ContextItem] = []
+
+    async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
+        if self._active:
+            raise RuntimeError("A reply is already in progress.")
+        self._active = True
+        try:
+            user_message = self._adapter.user_message(user_input)
+            response: ModelResponse[ContextItem] | None = None
+            async with aclosing(self._adapter.stream_response([*self._context, user_message])) as events:
+                async for event in events:
+                    assert response is None
+                    if isinstance(event, ModelResponse):
+                        response = event
+                    else:
+                        yield event
+            assert response is not None
+            # No await between committing both sides of the Turn and publishing success.
+            self._context.extend([user_message, *response.context_items])
+            yield ReplyCompleted(response.stop_reason, response.input_tokens, response.output_tokens)
+        finally:
+            self._active = False
+
+    async def aclose(self) -> None:
+        await self._adapter.aclose()
+
+
+class AnthropicAdapter(ProtocolAdapter[MessageParam]):
     def __init__(
         self, config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
         self._config = config
-        self._active = False
-        self._history: list[MessageParam] = []
         self._sdk = AsyncAnthropic(
             api_key=config.api_key,
             base_url=config.base_url,
@@ -180,12 +245,11 @@ class AnthropicClient(LLMClient):
             ),
         )
 
-    async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
-        if self._active:
-            raise RuntimeError("A reply is already in progress.")
-        self._active = True
+    def user_message(self, user_input: str) -> MessageParam:
+        return {"role": "user", "content": user_input}
+
+    async def stream_response(self, context: list[MessageParam]) -> AsyncGenerator[ResponseEvent[MessageParam], None]:
         try:
-            user_message: MessageParam = {"role": "user", "content": user_input}
             content: list[ContentBlock] = []
             input_tokens: int | None = None
             output_tokens: int | None = None
@@ -195,7 +259,7 @@ class AnthropicClient(LLMClient):
             async with await self._sdk.messages.create(
                 model=self._config.model,
                 max_tokens=self._config.max_output_tokens or DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS,
-                messages=[*self._history, user_message],
+                messages=context,
                 thinking=self._config.thinking if self._config.thinking is not None else omit,
                 output_config={"effort": self._config.thinking_effort} if self._config.thinking_effort is not None else omit,
                 stream=True,
@@ -244,26 +308,20 @@ class AnthropicClient(LLMClient):
                 raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
             if stop_reason not in {"end_turn", "stop_sequence", "refusal"}:
                 raise IncompleteReplyError("Reply incomplete: the output limit was reached or the stop reason is not supported.")
-            # No await between committing both sides of the turn and publishing success.
-            self._history.extend([user_message, {"role": "assistant", "content": content}])
-            yield ReplyCompleted(stop_reason, input_tokens, output_tokens)
+            yield ModelResponse(({"role": "assistant", "content": content},), stop_reason, input_tokens, output_tokens)
         except (APIError, httpx.HTTPError) as error:
             _raise_if_cancelled()
             raise _request_error(error, thinking=self._config.thinking is not None or self._config.thinking_effort is not None) from error
-        finally:
-            self._active = False
 
     async def aclose(self) -> None:
         await self._sdk.close()
 
 
-class OpenAIClient(LLMClient):
+class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
     def __init__(
         self, config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
     ) -> None:
         self._config = config
-        self._active = False
-        self._history: ResponseInputParam = []
         self._sdk = openai.AsyncOpenAI(
             api_key=config.api_key,
             base_url=config.base_url,
@@ -274,18 +332,19 @@ class OpenAIClient(LLMClient):
             ),
         )
 
-    async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
-        if self._active:
-            raise RuntimeError("A reply is already in progress.")
-        self._active = True
+    def user_message(self, user_input: str) -> ResponseInputItemParam:
+        return {"role": "user", "content": user_input}
+
+    async def stream_response(
+        self, context: list[ResponseInputItemParam],
+    ) -> AsyncGenerator[ResponseEvent[ResponseInputItemParam], None]:
         try:
-            user_message: ResponseInputItemParam = {"role": "user", "content": user_input}
             final: Response | None = None
             async with await self._sdk.responses.create(
                 model=self._config.model,
                 max_output_tokens=self._config.max_output_tokens if self._config.max_output_tokens is not None else openai.omit,
                 reasoning={"effort": self._config.thinking_effort} if self._config.thinking_effort is not None else openai.omit,
-                input=[*self._history, user_message],
+                input=context,
                 store=False,
                 stream=True,
             ) as stream:
@@ -318,10 +377,9 @@ class OpenAIClient(LLMClient):
                 if item.type == "message" and item.status != "completed":
                     raise IncompleteReplyError("Reply incomplete: the reply text is unfinished.")
             usage = final.usage
-            output = [cast(ResponseInputItemParam, item.to_dict()) for item in final.output]
-            # Only replay output items; response metadata is not conversation input.
-            self._history.extend([user_message, *output])
-            yield ReplyCompleted(
+            yield ModelResponse(
+                # Only replay output items; response metadata is not conversation input.
+                tuple(cast(ResponseInputItemParam, item.to_dict()) for item in final.output),
                 final.status,
                 getattr(usage, "input_tokens", None),
                 getattr(usage, "output_tokens", None),
@@ -329,8 +387,6 @@ class OpenAIClient(LLMClient):
         except (openai.APIError, httpx.HTTPError) as error:
             _raise_if_cancelled()
             raise _request_error(error, thinking=self._config.thinking_effort is not None) from error
-        finally:
-            self._active = False
 
     async def aclose(self) -> None:
         await self._sdk.close()
@@ -340,7 +396,7 @@ def create_client(
     config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
 ) -> LLMClient:
     if config.protocol == "anthropic":
-        return AnthropicClient(config, transport=transport)
+        return Conversation(AnthropicAdapter(config, transport=transport))
     if config.protocol == "openai":
-        return OpenAIClient(config, transport=transport)
+        return Conversation(OpenAIAdapter(config, transport=transport))
     raise ValueError("Unsupported protocol; expected anthropic or openai.")

@@ -91,6 +91,28 @@ async def test_turn_commit_requires_final_success_and_finished_cleanup(
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_abandoned_reply_closes_stream_and_stays_out_of_next_request(protocol: str) -> None:
+    events = reply_events(protocol)
+    abandoned = ControlledSSE(events, gate_after=len(events) - 2)
+    transport = RecordingTransport([ControlledSSE(reply_events(protocol)), abandoned, ControlledSSE(reply_events(protocol))])
+    async with create_client(provider_config(protocol), transport=transport) as client:
+        _ = [event async for event in client.stream_reply("first")]
+        reply = client.stream_reply("abandoned")
+        assert await anext(reply) == TextDelta("你好")
+        assert await anext(reply) == TextDelta("，世界\n")
+        await asyncio.wait_for(reply.aclose(), timeout=2)
+        assert abandoned.closed
+        assert [event async for event in reply] == []
+        _ = [event async for event in client.stream_reply("follow-up")]
+    field = "messages" if protocol == "anthropic" else "input"
+    assert json.loads(transport.requests[2].content)[field] == [
+        {"role": "user", "content": "first"}, *native_reply(protocol),
+        {"role": "user", "content": "follow-up"},
+    ]
+    assert transport.closed
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
 @pytest.mark.parametrize("ending", ["eof", "content_end", "output_limit", "incomplete", "tool_request", "tool_terminal"])
 async def test_unfinished_turn_preserves_previously_completed_history(protocol: str, ending: str) -> None:
     streams = [
