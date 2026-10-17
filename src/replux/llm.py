@@ -579,10 +579,14 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
 
 
 def create_client(
-    config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None, bash: str | None = None,
+    config: ProviderConfig,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    bash: str | None = None,
+    ripgrep: str | None = None,
 ) -> LLMClient:
     """Assemble a Conversation; relative tool paths start at the current (startup) directory."""
-    registry = create_default_registry(Path.cwd(), bash=bash)
+    registry = create_default_registry(Path.cwd(), bash=bash, ripgrep=ripgrep)
     if config.protocol == "anthropic":
         return Conversation(AnthropicAdapter(config, transport=transport), registry)
     if config.protocol == "openai":

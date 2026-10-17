@@ -7,6 +7,7 @@ from replux.tools.base import (
     ToolRegistry, ToolResult, ToolStatus, run_file_operation, summarize_arguments,
 )
 from replux.tools.edit_file import EditFileTool
+from replux.tools.find_files import FindFilesTool
 from replux.tools.read_file import ReadFileTool
 from replux.tools.run_command import RunCommandTool
 from replux.tools.session import SessionDirectory
@@ -19,7 +20,9 @@ __all__ = [
 ]
 
 
-def create_default_registry(root: Path, *, bash: str | None = None) -> ToolRegistry:
+def create_default_registry(
+    root: Path, *, bash: str | None = None, ripgrep: str | None = None,
+) -> ToolRegistry:
     """Register the built-in tools; relative tool paths start at root."""
     session = SessionDirectory()
     registry = ToolRegistry(session)
@@ -27,4 +30,5 @@ def create_default_registry(root: Path, *, bash: str | None = None) -> ToolRegis
     registry.register(WriteFileTool(root))
     registry.register(EditFileTool(root))
     registry.register(RunCommandTool(root, session, bash=bash))
+    registry.register(FindFilesTool(root, ripgrep=ripgrep))
     return registry

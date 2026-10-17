@@ -8,7 +8,7 @@ import httpx2 as httpx
 
 from replux.config import ConfigError, load_config
 from replux.llm import create_client
-from replux.tools.process import BashNotFound, require_bash
+from replux.tools.process import BashNotFound, RipgrepNotFound, require_bash, require_ripgrep
 from replux.tui import RepluxApp
 
 
@@ -21,9 +21,10 @@ def create_app(
     try:
         config = load_config(args.config)
         bash = require_bash()
-    except (ConfigError, BashNotFound) as error:
+        ripgrep = require_ripgrep()
+    except (ConfigError, BashNotFound, RipgrepNotFound) as error:
         parser.error(str(error))
-    return RepluxApp(create_client(config, transport=transport, bash=bash), model=config.model)
+    return RepluxApp(create_client(config, transport=transport, bash=bash, ripgrep=ripgrep), model=config.model)
 
 
 def main() -> None:

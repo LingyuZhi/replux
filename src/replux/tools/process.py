@@ -28,6 +28,16 @@ class BashNotFound(Exception):
     """Startup cannot continue because the bash executable is not on PATH."""
 
 
+class RipgrepNotFound(Exception):
+    """Startup cannot continue because the ripgrep executable is not on PATH."""
+
+
+RIPGREP_INSTALL_HINT = (
+    "Ripgrep was not found. Install ripgrep with your system package manager "
+    "and make sure the rg command is on PATH before starting Replux."
+)
+
+
 def require_bash() -> str:
     """Return the bash executable, or raise BashNotFound with an install hint."""
     found = shutil.which("bash")
@@ -36,6 +46,14 @@ def require_bash() -> str:
             "Bash was not found. Install Bash with your system package manager "
             "and make sure the bash command is on PATH before starting Replux."
         )
+    return found
+
+
+def require_ripgrep() -> str:
+    """Return the ripgrep executable, or raise RipgrepNotFound with an install hint."""
+    found = shutil.which("rg")
+    if found is None:
+        raise RipgrepNotFound(RIPGREP_INSTALL_HINT)
     return found
 
 
@@ -254,7 +272,21 @@ def _group_alive(pgid: int) -> bool:
         os.killpg(pgid, 0)
     except ProcessLookupError:
         return False
+    except PermissionError:
+        # macOS can return EPERM for a group that has already exited.
+        return _group_listed(pgid)
     return True
+
+
+def _group_listed(pgid: int) -> bool:
+    completed = subprocess.run(
+        ["ps", "-ax", "-o", "pgid=,stat="], check=False, capture_output=True, text=True,
+    )
+    for line in completed.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == str(pgid) and not parts[1].startswith("Z"):
+            return True
+    return False
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -262,6 +294,10 @@ def _signal_group(pgid: int, sig: int) -> None:
         os.killpg(pgid, sig)
     except ProcessLookupError:
         return
+    except PermissionError:
+        if not _group_listed(pgid):
+            return
+        raise
 
 
 async def _shield(call: Awaitable[_T]) -> _T:
