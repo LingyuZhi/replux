@@ -80,7 +80,11 @@ class ToolCallView(Vertical):
         lines = result.output.split("\n")
         if lines[-1:] == [""]:
             lines = lines[:-1]
-        self.query_one(".tool-preview", Static).update("\n".join(lines[:5]))
+        shown = lines[-5:] if self._name == "run_command" else lines[:5]
+        self.query_one(".tool-preview", Static).update("\n".join(shown))
+        log_path = result.details.get("log_path")
+        if isinstance(log_path, str) and log_path:
+            self.mount(Static(log_path, classes="tool-log", markup=False))
         if len(lines) > 5:
             self.mount(Collapsible(
                 Static(result.output, classes="tool-output", markup=False),
@@ -150,7 +154,8 @@ class RepluxApp(App[None]):
     .tool-dot.error { color: $error; }
     .tool-header { width: auto; margin-right: 1; }
     .tool-status { width: 1fr; color: $text-muted; text-wrap: nowrap; text-overflow: ellipsis; }
-    .tool-preview, .tool-output { color: $text-muted; }
+    .tool-preview, .tool-output, .tool-log { color: $text-muted; }
+    .tool-log { height: auto; }
     """
 
     def __init__(self, client: LLMClient, *, model: str) -> None:

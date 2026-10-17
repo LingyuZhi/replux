@@ -11,6 +11,8 @@ from typing import Any, Generic, Literal, TypeVar, get_args
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from replux.tools.session import SessionDirectory
+
 
 ToolCategory = Literal["read", "write", "execute"]
 ToolStatus = Literal["success", "error", "cancelled", "skipped"]
@@ -82,9 +84,10 @@ class ToolDefinition:
 class ToolRegistry:
     """Tools available to the model, registered at startup and read-only afterwards."""
 
-    def __init__(self) -> None:
+    def __init__(self, session: SessionDirectory | None = None) -> None:
         self._tools: dict[str, Tool[Any]] = {}
         self._definitions: list[ToolDefinition] = []
+        self.session = session
 
     def register(self, tool: Tool[Any]) -> None:
         if not isinstance(tool.name, str) or not _TOOL_NAME.fullmatch(tool.name):

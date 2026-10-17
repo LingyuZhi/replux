@@ -8,6 +8,8 @@ from replux.tools.base import (
 )
 from replux.tools.edit_file import EditFileTool
 from replux.tools.read_file import ReadFileTool
+from replux.tools.run_command import RunCommandTool
+from replux.tools.session import SessionDirectory
 from replux.tools.write_file import WriteFileTool
 
 __all__ = [
@@ -17,10 +19,12 @@ __all__ = [
 ]
 
 
-def create_default_registry(root: Path) -> ToolRegistry:
+def create_default_registry(root: Path, *, bash: str | None = None) -> ToolRegistry:
     """Register the built-in tools; relative tool paths start at root."""
-    registry = ToolRegistry()
+    session = SessionDirectory()
+    registry = ToolRegistry(session)
     registry.register(ReadFileTool(root))
     registry.register(WriteFileTool(root))
     registry.register(EditFileTool(root))
+    registry.register(RunCommandTool(root, session, bash=bash))
     return registry

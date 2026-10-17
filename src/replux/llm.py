@@ -346,7 +346,11 @@ class Conversation(LLMClient, Generic[ContextItem]):
             yield ToolFinished(call.id, call.name, summary, result, time.monotonic() - started)
 
     async def aclose(self) -> None:
-        await self._adapter.aclose()
+        try:
+            await self._adapter.aclose()
+        finally:
+            if self._tools.session is not None:
+                self._tools.session.cleanup()
 
 
 class AnthropicAdapter(ProtocolAdapter[MessageParam]):
@@ -575,11 +579,12 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
 
 
 def create_client(
-    config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None
+    config: ProviderConfig, *, transport: httpx.AsyncBaseTransport | None = None, bash: str | None = None,
 ) -> LLMClient:
     """Assemble a Conversation; relative tool paths start at the current (startup) directory."""
+    registry = create_default_registry(Path.cwd(), bash=bash)
     if config.protocol == "anthropic":
-        return Conversation(AnthropicAdapter(config, transport=transport), create_default_registry(Path.cwd()))
+        return Conversation(AnthropicAdapter(config, transport=transport), registry)
     if config.protocol == "openai":
-        return Conversation(OpenAIAdapter(config, transport=transport), create_default_registry(Path.cwd()))
+        return Conversation(OpenAIAdapter(config, transport=transport), registry)
     raise ValueError("Unsupported protocol; expected anthropic or openai.")
