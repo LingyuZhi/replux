@@ -335,3 +335,22 @@ async def test_cancelled_file_operation_waits_until_the_worker_stops() -> None:
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(running, timeout=2)
     assert not passed.is_set()
+
+
+async def test_a_finished_file_operation_keeps_its_result_when_cancellation_arrived() -> None:
+    entered, release = threading.Event(), threading.Event()
+
+    def operation(checkpoint: Any) -> str:
+        entered.set()
+        release.wait()
+        return "finished"
+
+    running = asyncio.create_task(run_file_operation(operation, timeout_seconds=10))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        running.cancel()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(running), timeout=0.1)
+    finally:
+        release.set()
+    assert await asyncio.wait_for(running, timeout=2) == "finished"

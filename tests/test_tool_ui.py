@@ -5,16 +5,20 @@ import json
 from pathlib import Path
 
 import pytest
+import httpx2 as httpx
 from textual.pilot import Pilot
 from textual.widgets import Collapsible, Static, TextArea
-from textual.worker import WorkerCancelled
+from textual.worker import WorkerCancelled, WorkerFailed
 
 from replux.cli import create_app
 from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta, ToolFinished, ToolStarted
-from replux.tools import ToolResult
+from replux.tools import ToolRegistry, ToolResult
 from replux.tui import RepluxApp, ToolCallView
-from tests.support import ControlledSSE, RecordingTransport, function_call_events, reply_events, tool_use_events
+from tests.support import ControlledSSE, RecordingTransport, function_call_events, provider_config, reply_events, tool_use_events
 from tests.test_config import VALID_YAML
+from tests.test_tool_batch import (
+    BoomRead, GatedRead, batch_events, open_client, read_call, result_pairs, text_gate,
+)
 
 
 EIGHT_LINES = "\n".join(f"{number}\tline {number}" for number in range(1, 9))
@@ -222,3 +226,308 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         assert "tool_choice" not in first
         assert summary_request["tool_choice"] == "none"
         assert summary_request["store"] is False
+
+
+def provider_file(tmp_path: Path, protocol: str) -> Path:
+    path = tmp_path / "provider.yaml"
+    path.write_text(VALID_YAML.replace("protocol: anthropic", f"protocol: {protocol}"), encoding="utf-8")
+    return path
+
+
+def statuses(app: RepluxApp) -> list[str]:
+    return [str(view.query_one(".tool-status", Static).content) for view in app.query(ToolCallView).results(ToolCallView)]
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_a_failed_batch_shows_each_result_and_finishes_after_the_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
+) -> None:
+    (tmp_path / "ok.txt").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "later.txt").write_text("should-not\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    calls = (read_call("call_ok", "ok.txt"), read_call("call_missing", "missing.txt"), read_call("call_later", "later.txt"))
+    summary = ControlledSSE(reply_events(protocol), gate_after=0)
+    transport = RecordingTransport([ControlledSSE(batch_events(protocol, calls)), summary])
+    app = create_app(["--config", str(provider_file(tmp_path, protocol))], transport=transport)
+    async with app.run_test(size=(80, 40)) as pilot:
+        app.query_one("#prompt", TextArea).text = "read three"
+        await pilot.press("enter")
+        await asyncio.wait_for(summary.blocked.wait(), timeout=2)
+        await pilot.pause()
+        assert statuses(app)[0].startswith("success · ")
+        assert statuses(app)[1].startswith("error (file_not_found) · ")
+        assert statuses(app)[2] == "skipped"
+        views = list(app.query(ToolCallView).results(ToolCallView))
+        assert views[1].query_one(".tool-dot", Static).has_class("error")
+        assert not views[2].query_one(".tool-dot", Static).has_class("running")
+        assert "should-not" not in visible_text(app)
+        assert app.query_one("#status", Static).content == "Generating..."
+        if protocol == "anthropic":
+            assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
+        summary.release.set()
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
+        assert app.query_one("#status", Static).content == "Ready"
+        assert str(views[1].query_one(".tool-status", Static).content).startswith("error (file_not_found)")
+        assert [reply.content for reply in app.query(".reply").results(Static)][-1] == "你好，世界\n"
+    assert "should-not" not in transport.requests[1].content.decode()
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_unpairable_tool_calls_report_an_error_and_accept_another_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
+) -> None:
+    (tmp_path / "ok.txt").write_text("alpha\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    calls = (read_call("call_ok", "ok.txt"), read_call("call_ok", "ok.txt"))
+    transport = RecordingTransport([
+        ControlledSSE(batch_events(protocol, calls)), ControlledSSE(reply_events(protocol)),
+    ])
+    app = create_app(["--config", str(provider_file(tmp_path, protocol))], transport=transport)
+    async with app.run_test(size=(80, 30)) as pilot:
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "read"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
+        assert not app.query(ToolCallView)
+        assert "missing or duplicate" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "Ready"
+        prompt.text = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    field = "messages" if protocol == "anthropic" else "input"
+    assert json.loads(transport.requests[1].content)[field] == [{"role": "user", "content": "follow-up"}]
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_cleanup_failure_shows_an_error_and_accepts_another_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
+) -> None:
+    (tmp_path / "ok.txt").write_text("alpha\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    broken = ControlledSSE(
+        batch_events(protocol, (read_call("call_ok", "ok.txt"),)), close_error=httpx.ReadError("offline cleanup failure"),
+    )
+    transport = RecordingTransport([broken, ControlledSSE(reply_events(protocol))])
+    app = create_app(["--config", str(provider_file(tmp_path, protocol))], transport=transport)
+    async with app.run_test(size=(80, 30)) as pilot:
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "read"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
+        assert not app.query(ToolCallView)
+        assert "Request failed" in str(app.query_one(".turn-status", Static).content)
+        assert app.query_one("#status", Static).content == "Ready"
+        prompt.text = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    assert broken.closed
+    field = "messages" if protocol == "anthropic" else "input"
+    assert json.loads(transport.requests[1].content)[field] == [{"role": "user", "content": "follow-up"}]
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_a_second_tool_batch_stops_the_turn_and_keeps_the_finished_tool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
+) -> None:
+    (tmp_path / "ok.txt").write_text("alpha\n", encoding="utf-8")
+    (tmp_path / "later.txt").write_text("should-not\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    transport = RecordingTransport([
+        ControlledSSE(batch_events(protocol, (read_call("call_ok", "ok.txt"),))),
+        ControlledSSE(batch_events(protocol, (read_call("call_again", "later.txt"),))),
+        ControlledSSE(reply_events(protocol)),
+    ])
+    app = create_app(["--config", str(provider_file(tmp_path, protocol))], transport=transport)
+    async with app.run_test(size=(80, 32)) as pilot:
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "read"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
+        assert len(statuses(app)) == 1
+        assert statuses(app)[0].startswith("success · ")
+        assert "tool batch" in str(app.query_one(".turn-status", Static).content)
+        assert "should-not" not in visible_text(app)
+        assert app.query_one("#status", Static).content == "Ready"
+        prompt.text = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    body = transport.requests[2].content.decode()
+    assert "call_ok" in body
+    assert "call_again" not in body
+    assert "should-not" not in body
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_cancelling_the_summary_keeps_tool_results_and_restores_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
+) -> None:
+    (tmp_path / "ok.txt").write_text("alpha\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    summary = ControlledSSE(reply_events(protocol), gate_after=text_gate(protocol))
+    summary.release_close.clear()
+    transport = RecordingTransport([
+        ControlledSSE(batch_events(protocol, (read_call("call_ok", "ok.txt"),))), summary,
+        ControlledSSE(reply_events(protocol)),
+    ])
+    app = create_app(["--config", str(provider_file(tmp_path, protocol))], transport=transport)
+    async with app.run_test(size=(80, 32)) as pilot:
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "read"
+        await pilot.press("enter")
+        await asyncio.wait_for(summary.blocked.wait(), timeout=2)
+        await pilot.pause()
+        assert statuses(app)[0].startswith("success · ")
+        assert app.query_one("#status", Static).content == "Generating..."
+        worker = next(iter(app.workers))
+        try:
+            await pilot.press("ctrl+c")
+            await asyncio.wait_for(summary.closing.wait(), timeout=2)
+            assert app.query_one("#status", Static).content == "Cancelling..."
+            assert statuses(app)[0].startswith("success · ")
+            prompt.text = "草稿"
+            await pilot.press("enter", "ctrl+c")
+            assert prompt.text == "草稿"
+            assert len(transport.requests) == 2
+            assert not summary.closed
+        finally:
+            summary.release_close.set()
+            with pytest.raises(WorkerCancelled):
+                await asyncio.wait_for(worker.wait(), timeout=2)
+        await pilot.pause()
+        assert app.query_one("#status", Static).content == "Ready"
+        assert str(app.query_one(".turn-status", Static).content) == "Cancelled"
+        assert statuses(app)[0].startswith("success · ")
+        prompt.text = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    history = json.dumps(result_pairs(protocol, transport.requests[2]), ensure_ascii=False)
+    assert "call_ok" in transport.requests[2].content.decode()
+    assert '"status": "success"' in history
+    assert "你好" not in transport.requests[2].content.decode()
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_tool_cleanup_blocks_submit_then_shows_cancelled_and_skipped(
+    tmp_path: Path, protocol: str,
+) -> None:
+    side_effect = tmp_path / "ran.txt"
+    tool = GatedRead(side_effect)
+    registry = ToolRegistry()
+    registry.register(tool)
+    calls = (read_call("call_run", "ok.txt"), read_call("call_next", "later.txt"))
+    transport = RecordingTransport([
+        ControlledSSE(batch_events(protocol, calls)), ControlledSSE(reply_events(protocol)),
+    ])
+    app = RepluxApp(open_client(protocol, transport, registry), model="scripted-model")
+    async with app.run_test(size=(80, 32)) as pilot:
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "read them"
+        await pilot.press("enter")
+        await asyncio.wait_for(tool.entered.wait(), timeout=2)
+        await pilot.pause()
+        assert statuses(app) == ["running"]
+        assert app.query_one("#status", Static).content == "Running read_file..."
+        if protocol == "anthropic":
+            assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
+        prompt.text = "草稿"
+        await pilot.press("enter")
+        assert prompt.text == "草稿"
+        assert len(transport.requests) == 1
+        worker = next(iter(app.workers))
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.query_one("#status", Static).content == "Cancelling..."
+        assert app.query_one(".tool-dot", Static).has_class("running")
+        prompt.text = "草稿仍可编辑"
+        await pilot.press("enter", "ctrl+c")
+        assert app.query_one("#status", Static).content == "Cancelling..."
+        assert not tool.stopped.is_set()
+        assert not side_effect.exists()
+        tool.release.set()
+        with pytest.raises(WorkerCancelled):
+            await asyncio.wait_for(worker.wait(), timeout=2)
+        await pilot.pause()
+        assert app.query_one("#status", Static).content == "Ready"
+        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["cancelled", "skipped"]
+        assert str(app.query_one(".turn-status", Static).content) == "Cancelled"
+        assert prompt.text == "草稿仍可编辑"
+        if protocol == "anthropic":
+            assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
+        prompt.text = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    assert tool.runs == 1
+    assert not side_effect.exists()
+    assert [payload["status"] for _, payload in result_pairs(protocol, transport.requests[1])] == ["cancelled", "skipped"]
+    assert "你好" not in transport.requests[1].content.decode()
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_cancel_while_showing_a_tool_keeps_unstarted_calls_skipped(
+    tmp_path: Path, protocol: str,
+) -> None:
+    tool = GatedRead(tmp_path / "ran.txt")
+    registry = ToolRegistry()
+    registry.register(tool)
+    transport = RecordingTransport([
+        ControlledSSE(batch_events(protocol, (read_call("call_run", "ok.txt"), read_call("call_next", "later.txt")))),
+        ControlledSSE(reply_events(protocol)),
+    ])
+    app = RepluxApp(open_client(protocol, transport, registry), model="scripted-model")
+    async with app.run_test(size=(80, 32)) as pilot:
+        transcript = app.query_one("#transcript-content")
+        mount = transcript.mount
+        seen = False
+
+        async def cancel_first_tool(*children: object, **kwargs: object) -> None:
+            nonlocal seen
+            await mount(*children, **kwargs)  # type: ignore[arg-type]
+            if seen or not any(isinstance(child, ToolCallView) for child in children):
+                return
+            seen = True
+            raise asyncio.CancelledError
+
+        transcript.mount = cancel_first_tool  # type: ignore[assignment]
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "read them"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["skipped", "skipped"]
+        assert app.query_one("#status", Static).content == "Ready"
+        prompt.text = "follow-up"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    assert tool.runs == 0
+    assert not (tmp_path / "ran.txt").exists()
+    assert [payload["status"] for _, payload in result_pairs(protocol, transport.requests[1])] == ["skipped", "skipped"]
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+async def test_an_internal_tool_error_terminates_the_chat_after_cleanup(protocol: str) -> None:
+    tool = BoomRead()
+    registry = ToolRegistry()
+    registry.register(tool)
+    stream = ControlledSSE(batch_events(protocol, (read_call("call_boom", "ok.txt"), read_call("call_later", "later.txt"))))
+    transport = RecordingTransport([stream])
+    app = RepluxApp(
+        open_client(protocol, transport, registry), model=provider_config(protocol).model,
+    )
+    with pytest.raises(WorkerFailed, match="injected defect"):
+        async with app.run_test() as pilot:
+            app.query_one("#prompt", TextArea).text = "read"
+            await pilot.press("enter")
+            await asyncio.wait_for(tool.entered.wait(), timeout=2)
+            await pilot.pause()
+            assert str(app.query_one("#status", Static).content).startswith("Running")
+            tool.release.set()
+            await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+    assert app.return_code == 1
+    assert tool.runs == 1
+    assert stream.closed
+    assert transport.closed
+    assert len(transport.requests) == 1

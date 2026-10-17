@@ -430,8 +430,11 @@ async def test_ended_tool_batch_commits_its_real_results_without_a_summary(endin
             pending = asyncio.create_task(anext(reply))
             await asyncio.wait_for(tool.entered.wait(), timeout=2)
             pending.cancel()
+            finished = await asyncio.wait_for(pending, timeout=2)
+            assert isinstance(finished, ToolFinished)
+            assert finished.result.status == "cancelled"
             with pytest.raises(asyncio.CancelledError):
-                await pending
+                await anext(reply)
         else:
             await reply.aclose()
         assert not tool.release.is_set()

@@ -1,7 +1,7 @@
 """Full-screen text chat using the shared LLM interface."""
 
 import asyncio
-from contextlib import aclosing
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from importlib.metadata import version
 from pathlib import Path
 
@@ -15,7 +15,8 @@ from textual.worker import WorkerCancelled
 from textual.widgets import Collapsible, Static, TextArea
 
 from replux.llm import (
-    IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, TextDelta, ThinkingDelta, ToolFinished, ToolStarted,
+    IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta,
+    ToolBatchLimitError, ToolFinished, ToolStarted,
 )
 from replux.tools import ToolResult
 
@@ -94,6 +95,23 @@ class ToolCallView(Vertical):
 def _tool_status_text(result: ToolResult, duration_seconds: float | None) -> str:
     label = f"error ({result.error_code})" if result.status == "error" else result.status
     return label if duration_seconds is None else f"{label} · {duration_seconds:.2f}s"
+
+
+async def _show_after_cancel(
+    events: AsyncGenerator[StreamEvent, None], show: Callable[[StreamEvent], Awaitable[None]],
+) -> None:
+    """Ask a paused reply to publish terminal tool events, then render them."""
+    try:
+        event = await events.athrow(asyncio.CancelledError())
+    except (asyncio.CancelledError, StopAsyncIteration):
+        return
+    await show(event)
+    while True:
+        try:
+            event = await anext(events)
+        except (asyncio.CancelledError, StopAsyncIteration):
+            return
+        await show(event)
 
 
 class Prompt(TextArea):
@@ -220,53 +238,72 @@ class RepluxApp(App[None]):
         thinking_text = ""
         thinking: Static | None = None
         tools: dict[str, ToolCallView] = {}
+
+        async def show(event: StreamEvent) -> None:
+            nonlocal reply, text, thinking, thinking_text
+            self._follow_transcript()
+            if isinstance(event, TextDelta):
+                if reply is None:
+                    reply = Static("", classes="reply", markup=False)
+                    text = ""
+                    await transcript.mount(reply)
+                text += event.text
+                reply.update(text)
+            elif isinstance(event, ThinkingDelta) and event.text:
+                thinking_text += event.text
+                if thinking is None:
+                    if not thinking_text.strip():
+                        return
+                    thinking = Static(thinking_text, classes="thinking-content", markup=False)
+                    await transcript.mount(
+                        Collapsible(
+                            thinking, title="Thinking", collapsed=True,
+                            collapsed_symbol="+", expanded_symbol="-", classes="thinking",
+                        ),
+                        before=first_reply,
+                    )
+                else:
+                    thinking.update(thinking_text)
+            elif isinstance(event, ToolStarted):
+                view = ToolCallView(event.name, event.summary)
+                tools[event.call_id] = view
+                await transcript.mount(view)
+                self.query_one("#status", Static).update(f"Running {event.name}...")
+                reply = None
+            elif isinstance(event, ToolFinished):
+                finished = tools.get(event.call_id)
+                if finished is None:
+                    finished = ToolCallView(event.name, event.summary)
+                    tools[event.call_id] = finished
+                    await transcript.mount(finished)
+                finished.finish(event.result, event.duration_seconds)
+                if not self._cancelling:
+                    self.query_one("#status", Static).update("Generating...")
+                reply = None
+            elif isinstance(event, ReplyCompleted):
+                self.query_one("#status", Static).update("Ready")
+
+        events: AsyncGenerator[StreamEvent, None] | None = None
         try:
             self._follow_transcript()
             await transcript.mount(Static(user_input, classes="user", markup=False), first_reply)
             if self._cancelling:
                 raise asyncio.CancelledError
-            async with aclosing(self._client.stream_reply(user_input)) as events:
-                async for event in events:
-                    self._follow_transcript()
-                    if isinstance(event, TextDelta):
-                        if reply is None:
-                            reply = Static("", classes="reply", markup=False)
-                            text = ""
-                            await transcript.mount(reply)
-                        text += event.text
-                        reply.update(text)
-                    elif isinstance(event, ThinkingDelta) and event.text:
-                        thinking_text += event.text
-                        if thinking is None:
-                            if not thinking_text.strip():
-                                continue
-                            thinking = Static(thinking_text, classes="thinking-content", markup=False)
-                            await transcript.mount(
-                                Collapsible(
-                                    thinking, title="Thinking", collapsed=True,
-                                    collapsed_symbol="+", expanded_symbol="-", classes="thinking",
-                                ),
-                                before=first_reply,
-                            )
-                        else:
-                            thinking.update(thinking_text)
-                    elif isinstance(event, ToolStarted):
-                        view = ToolCallView(event.name, event.summary)
-                        tools[event.call_id] = view
-                        await transcript.mount(view)
-                        self.query_one("#status", Static).update(f"Running {event.name}...")
-                        reply = None
-                    elif isinstance(event, ToolFinished):
-                        finished = tools.get(event.call_id)
-                        if finished is None:
-                            finished = ToolCallView(event.name, event.summary)
-                            tools[event.call_id] = finished
-                            await transcript.mount(finished)
-                        finished.finish(event.result, event.duration_seconds)
-                        self.query_one("#status", Static).update("Generating...")
-                        reply = None
-                    elif isinstance(event, ReplyCompleted):
-                        self.query_one("#status", Static).update("Ready")
+            events = self._client.stream_reply(user_input)
+            while True:
+                try:
+                    event = await anext(events)
+                except StopAsyncIteration:
+                    break
+                except asyncio.CancelledError:
+                    raise
+                try:
+                    await show(event)
+                except asyncio.CancelledError:
+                    # The generator is paused on the event just shown. Throw cancellation
+                    # there so an unstarted call stays skipped and the UI can render it.
+                    await _show_after_cancel(events, show)
+                    raise
         except asyncio.CancelledError:
             for view in tools.values():
                 view.cancel()
@@ -275,9 +312,15 @@ class RepluxApp(App[None]):
                 await transcript.mount(Static("Cancelled", classes="turn-status", markup=False))
             raise
         except LLMError as error:
-            message = str(error) if isinstance(error, IncompleteReplyError) else f"Request failed: {error}"
+            if isinstance(error, (IncompleteReplyError, ToolBatchLimitError)):
+                message = str(error)
+            else:
+                message = f"Request failed: {error}"
             self._follow_transcript()
             await transcript.mount(Static(message, classes="turn-status", markup=False))
+        finally:
+            if events is not None:
+                await events.aclose()
 
     async def on_unmount(self) -> None:
         try:

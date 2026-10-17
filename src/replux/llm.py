@@ -286,15 +286,27 @@ class Conversation(LLMClient, Generic[ContextItem]):
                     raise IncompleteReplyError("Reply incomplete: tool calls have missing or duplicate IDs.")
                 uncommitted.extend(response.context_items)
                 results: list[tuple[ToolCall, ToolResult]] = []
+                durations: dict[str, float] = {}
+                shown = 0
                 try:
-                    async with aclosing(self._run_batch(response.tool_calls, results)) as batch:
-                        async for tool_event in batch:
+                    batch = self._run_batch(response.tool_calls, results, durations)
+                    async with aclosing(batch) as tool_events:
+                        async for tool_event in tool_events:
+                            if isinstance(tool_event, ToolFinished):
+                                shown += 1
                             yield tool_event
-                except (asyncio.CancelledError, GeneratorExit):
+                except (asyncio.CancelledError, GeneratorExit) as stop:
                     # Started tool work stays in the Context even when the Turn ends early.
                     for call in response.tool_calls[len(results):]:
                         results.append((call, ToolResult("skipped", "Not run because the user cancelled the Turn.")))
                     self._context.extend([*uncommitted, *self._adapter.tool_results(results)])
+                    # Commit before publishing. The caller may stop as soon as cancellation
+                    # resumes it, and these results must already be in the Context.
+                    if isinstance(stop, asyncio.CancelledError):
+                        for call, result in results[shown:]:
+                            yield ToolFinished(
+                                call.id, call.name, summarize_arguments(call.arguments), result, durations.get(call.id),
+                            )
                     raise
                 self._context.extend([*uncommitted, *self._adapter.tool_results(results)])
                 uncommitted = []
@@ -303,7 +315,10 @@ class Conversation(LLMClient, Generic[ContextItem]):
             self._active = False
 
     async def _run_batch(
-        self, calls: Sequence[ToolCall], results: list[tuple[ToolCall, ToolResult]],
+        self,
+        calls: Sequence[ToolCall],
+        results: list[tuple[ToolCall, ToolResult]],
+        durations: dict[str, float],
     ) -> AsyncGenerator[StreamEvent, None]:
         """Run calls in order, appending each result; stop after the first unsuccessful one."""
         for call in calls:
@@ -318,8 +333,15 @@ class Conversation(LLMClient, Generic[ContextItem]):
             try:
                 result = await self._tools.execute(call.name, call.arguments)
             except asyncio.CancelledError:
+                durations[call.id] = time.monotonic() - started
                 results.append((call, ToolResult("cancelled", "Cancelled by the user before the tool call finished.")))
                 raise
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                # The tool returned its real result after cancellation was requested.
+                durations[call.id] = time.monotonic() - started
+                results.append((call, result))
+                raise asyncio.CancelledError
             results.append((call, result))
             yield ToolFinished(call.id, call.name, summary, result, time.monotonic() - started)
 

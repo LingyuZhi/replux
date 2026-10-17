@@ -164,6 +164,8 @@ async def run_file_operation(
 
     Timeout and cancellation both wait until the thread has returned, so no
     caller sees the operation as finished while it can still touch files.
+    A result the thread already returned is kept; only a checkpoint stop
+    becomes a timeout or cancellation.
     """
     stop = threading.Event()
 
@@ -187,8 +189,10 @@ async def run_file_operation(
     error = work.exception()
     if error is not None and not isinstance(error, _Stopped):
         raise error
-    if cancelled:
-        raise asyncio.CancelledError
-    if error is not None:
+    if isinstance(error, _Stopped):
+        # The thread stopped at a checkpoint. A finished return value is kept below,
+        # even when cancellation already arrived, because that work did complete.
+        if cancelled:
+            raise asyncio.CancelledError
         raise FileOperationTimeout
     return work.result()

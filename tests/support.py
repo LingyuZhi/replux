@@ -116,13 +116,21 @@ def thinking_events(
     return events
 
 
-def tool_use_events(
-    arguments: tuple[str, ...] = ('{"path": ', '"notes.txt"}'), *,
-    name: str = "read_file", call_id: str = "toolu_read", stop_reason: str = "tool_use",
+def tool_batch_events(
+    calls: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+        ("toolu_read", "read_file", ('{"path": ', '"notes.txt"}')),
+    ),
+    *,
+    stop_reason: str = "tool_use",
+    decoy_input: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """An Anthropic response with Thinking, text, and one tool_use whose arguments arrive in pieces."""
+    """Anthropic response with Thinking, text, and tool calls whose argument pieces are interleaved.
+
+    Pieces for different blocks share the stream but keep their own block index.
+    decoy_input is the object carried on each tool_use start; execution must use the pieces.
+    """
     start = reply_events()[0]
-    return [
+    events: list[dict[str, Any]] = [
         start,
         {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}},
         {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "先看文件"}},
@@ -131,15 +139,37 @@ def tool_use_events(
         {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}},
         {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "我先读文件。"}},
         {"type": "content_block_stop", "index": 1},
-        {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {}}},
-        *[
-            {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": piece}}
-            for piece in arguments
-        ],
-        {"type": "content_block_stop", "index": 2},
-        {"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": 20}},
-        {"type": "message_stop"},
     ]
+    base = 2
+    for offset, (call_id, name, _) in enumerate(calls):
+        events.append({
+            "type": "content_block_start", "index": base + offset,
+            "content_block": {"type": "tool_use", "id": call_id, "name": name, "input": {} if decoy_input is None else decoy_input},
+        })
+    piece_count = max(len(pieces) for _, _, pieces in calls)
+    for piece_index in range(piece_count):
+        for offset, (_, _, pieces) in enumerate(calls):
+            if piece_index < len(pieces):
+                events.append({
+                    "type": "content_block_delta", "index": base + offset,
+                    "delta": {"type": "input_json_delta", "partial_json": pieces[piece_index]},
+                })
+    events.extend(
+        {"type": "content_block_stop", "index": base + offset} for offset in range(len(calls))
+    )
+    events.append({
+        "type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": 20},
+    })
+    events.append({"type": "message_stop"})
+    return events
+
+
+def tool_use_events(
+    arguments: tuple[str, ...] = ('{"path": ', '"notes.txt"}'), *,
+    name: str = "read_file", call_id: str = "toolu_read", stop_reason: str = "tool_use",
+) -> list[dict[str, Any]]:
+    """An Anthropic response with Thinking, text, and one tool_use whose arguments arrive in pieces."""
+    return tool_batch_events(((call_id, name, arguments),), stop_reason=stop_reason)
 
 
 def function_call_events(
