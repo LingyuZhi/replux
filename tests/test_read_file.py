@@ -21,7 +21,7 @@ async def read(registry: ToolRegistry, **arguments: Any) -> ToolResult:
 
 def test_read_file_schema_comes_from_its_strict_parameter_model() -> None:
     registry = create_default_registry(Path("/startup"))
-    [definition] = registry.definitions()
+    definition = next(item for item in registry.definitions() if item.name == "read_file")
     tool = registry.get("read_file")
     assert definition.name == "read_file"
     assert definition.input_schema == tool.params_model.model_json_schema()
