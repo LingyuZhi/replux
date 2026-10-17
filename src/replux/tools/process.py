@@ -282,6 +282,9 @@ def _group_listed(pgid: int) -> bool:
     completed = subprocess.run(
         ["ps", "-ax", "-o", "pgid=,stat="], check=False, capture_output=True, text=True,
     )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "ps failed"
+        raise RuntimeError(f"Cannot list process group {pgid}: {detail}.")
     for line in completed.stdout.splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[0] == str(pgid) and not parts[1].startswith("Z"):

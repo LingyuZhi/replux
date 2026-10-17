@@ -124,8 +124,8 @@ async def _list_matching_files(
     )
     if isinstance(allowed, ToolResult):
         return allowed
-    if not allowed:
-        return []
+    # An empty scope still has to run the glob. A pattern such as "[" is an error,
+    # and that failure must not look like a successful empty search.
     matched = await _run_files(
         ripgrep, directory, pattern=pattern,
         include_hidden=include_hidden, include_ignored=include_ignored,

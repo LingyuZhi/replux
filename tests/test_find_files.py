@@ -241,6 +241,23 @@ async def test_unreadable_directories_and_bad_globs_are_errors(tmp_path: Path) -
     assert "error parsing glob" in invalid.output
 
 
+async def test_an_invalid_glob_is_an_error_even_when_nothing_is_in_scope(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (tmp_path / "secret.log").write_text("x", encoding="utf-8")
+    (tmp_path / ".gitignore").write_text("*.log\n", encoding="utf-8")
+    registry = create_default_registry(tmp_path)
+    empty_pattern = await find(registry, pattern="[", path="empty")
+    ignored_only = await find(registry, pattern="[")
+    assert empty_pattern.status == ignored_only.status == "error"
+    assert empty_pattern.error_code == ignored_only.error_code == "invalid_pattern"
+    assert "error parsing glob" in empty_pattern.output
+    assert "error parsing glob" in ignored_only.output
+    matched = await find(registry, pattern="*.txt", path="empty")
+    assert matched.status == "success"
+    assert matched.output == f"No files matched in {empty}."
+
+
 async def test_a_missing_ripgrep_binary_is_an_error(tmp_path: Path) -> None:
     _write(tmp_path / "keep.txt")
     registry = ToolRegistry()
