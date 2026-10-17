@@ -77,6 +77,39 @@ def target_file(path: Path) -> Path:
     return resolved
 
 
+def commit_error_code(error: OSError, state: str) -> str:
+    """Map a failed replacement to a stable tool error code."""
+    if state == "directory" or isinstance(error, IsADirectoryError):
+        return "not_a_file"
+    if isinstance(error, PermissionError):
+        return "permission_denied"
+    if isinstance(error, NotADirectoryError):
+        return "not_a_directory"
+    return "write_failed"
+
+
+def describe_commit(path: Path, intended: bytes | None = None) -> tuple[str, str]:
+    """Return the target's state after a commit stops or fails.
+
+    ``written`` is used only when ``intended`` is present and those bytes are
+    already on disk. The sentence reports that known state.
+    """
+    try:
+        probe = target_file(path)
+        if probe.is_dir():
+            return "directory", f"{probe} is a directory and was not replaced."
+        if not probe.exists():
+            return "absent", f"{probe} was not created."
+        current = probe.read_bytes()
+    except OSError as error:
+        if path.is_symlink():
+            return "symlink", f"{path} is still a symlink and was not replaced."
+        return "unknown", f"The state of {path} could not be read: {error.strerror or 'unknown error'}."
+    if intended is not None and current == intended:
+        return "written", f"{probe} contains the new {len(intended)} bytes."
+    return "not_replaced", f"{probe} was not replaced. It contains {len(current)} bytes."
+
+
 def _ensure_parent(destination: Path) -> None:
     parent = destination.parent
     cursor = parent

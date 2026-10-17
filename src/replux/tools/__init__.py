@@ -6,6 +6,7 @@ from replux.tools.base import (
     FILE_OPERATION_TIMEOUT_SECONDS, FileOperationTimeout, Tool, ToolCategory, ToolDefinition, ToolParams,
     ToolRegistry, ToolResult, ToolStatus, run_file_operation, summarize_arguments,
 )
+from replux.tools.edit_file import EditFileTool
 from replux.tools.read_file import ReadFileTool
 from replux.tools.write_file import WriteFileTool
 
@@ -21,4 +22,5 @@ def create_default_registry(root: Path) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(ReadFileTool(root))
     registry.register(WriteFileTool(root))
+    registry.register(EditFileTool(root))
     return registry

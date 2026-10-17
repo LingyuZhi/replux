@@ -10,7 +10,7 @@ from replux.tools.base import (
     FILE_OPERATION_TIMEOUT_SECONDS, FileOperationTimeout, Tool, ToolParams, ToolResult, error_result,
     run_file_operation,
 )
-from replux.tools.commit import CommitHold, commit_file, target_file
+from replux.tools.commit import CommitHold, commit_error_code, commit_file, describe_commit
 
 
 class WriteFileParams(ToolParams):
@@ -53,9 +53,9 @@ def _write(target: Path, data: bytes, checkpoint: Callable[[], None], hold: Comm
     try:
         commit_file(target, data, checkpoint, hold=hold)
     except OSError as error:
-        state, sentence = _describe(target, data)
+        state, sentence = describe_commit(target, data)
         return error_result(
-            _error_code(error, state),
+            commit_error_code(error, state),
             f"Cannot write {target}: {error.strerror or 'unknown error'}. {sentence}",
             path=str(target), file_state=state,
         )
@@ -65,34 +65,9 @@ def _write(target: Path, data: bytes, checkpoint: Callable[[], None], hold: Comm
 
 
 def _stopped(target: Path, data: bytes, status: str, lead: str) -> ToolResult:
-    state, sentence = _describe(target, data)
+    state, sentence = describe_commit(target, data)
     if status == "cancelled":
         return ToolResult("cancelled", f"{lead} {sentence}", details={"path": str(target), "file_state": state})
     return error_result("timeout", f"{lead} {sentence}", path=str(target), file_state=state)
 
 
-def _error_code(error: OSError, state: str) -> str:
-    if state == "directory" or isinstance(error, IsADirectoryError):
-        return "not_a_file"
-    if isinstance(error, PermissionError):
-        return "permission_denied"
-    if isinstance(error, NotADirectoryError):
-        return "not_a_directory"
-    return "write_failed"
-
-
-def _describe(path: Path, intended: bytes) -> tuple[str, str]:
-    try:
-        probe = target_file(path)
-        if probe.is_dir():
-            return "directory", f"{probe} is a directory and was not replaced."
-        if not probe.exists():
-            return "absent", f"{probe} was not created."
-        current = probe.read_bytes()
-    except OSError as error:
-        if path.is_symlink():
-            return "symlink", f"{path} is still a symlink and was not replaced."
-        return "unknown", f"The state of {path} could not be read: {error.strerror or 'unknown error'}."
-    if current == intended:
-        return "written", f"{probe} contains the new {len(intended)} bytes."
-    return "not_replaced", f"{probe} was not replaced. It contains {len(current)} bytes."
