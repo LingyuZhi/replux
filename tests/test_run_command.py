@@ -183,6 +183,7 @@ def test_run_command_schema_is_execute_and_keeps_the_production_limits() -> None
     assert schema["properties"]["timeout_seconds"]["maximum"] == COMMAND_TIMEOUT_LIMIT_SECONDS == 600
     assert definition.description.isascii()
     assert "non-interactive" in definition.description and "600" in definition.description
+    assert "100 MiB" in definition.description
     assert registry.session is not None
     registry.session.cleanup()
 
@@ -308,6 +309,40 @@ async def test_empty_success_stays_success_and_nonzero_returns_the_output(comman
     assert "failed line" in failed.output
     assert "Changes the command already made were kept." in failed.output
     assert target.read_text(encoding="utf-8") == "partial"
+
+
+async def test_cancel_stops_a_command_that_already_closed_stdout(commands: Commands, tmp_path: Path) -> None:
+    leader = tmp_path / "leader.pid"
+    registry = commands.registry(grace_seconds=0.4)
+    tool = registry.get("run_command")
+    assert isinstance(tool, RunCommandTool)
+    running = asyncio.create_task(tool.execute(tool.params_model(
+        command=f"echo $$ > {shlex.quote(str(leader))}; exec >/dev/null; sleep 30",
+        timeout_seconds=30,
+    )))
+    await wait_for_text(leader)
+    await asyncio.sleep(0.2)
+    running.cancel()
+    started = time.monotonic()
+    result = await asyncio.wait_for(running, timeout=3)
+    assert result.status == "cancelled"
+    assert process_state(int(leader.read_text())) == "dead"
+    assert time.monotonic() - started < 2
+
+
+async def test_a_byte_cut_then_a_line_cut_does_not_keep_a_stale_fragment(
+    commands: Commands, tmp_path: Path,
+) -> None:
+    sample = tmp_path / "sample.txt"
+    sample.write_bytes(b"abcdefghi\nL2\nL3\n")
+    registry = commands.registry(byte_limit=10, line_limit=2)
+    result = await run(registry, command=f"cat {shlex.quote(str(sample))}")
+    assert result.details["truncated_by"] == "lines_and_bytes"
+    assert "line_fragment" not in result.details
+    assert "tail of a longer line" not in result.output
+    assert "the last 2 lines" in result.output
+    assert "also exceeded 10 bytes" in result.output
+    assert result.output.endswith("L2\nL3\n")
 
 
 async def test_closing_stdout_does_not_outrun_the_timeout(commands: Commands, tmp_path: Path) -> None:

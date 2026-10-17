@@ -42,7 +42,8 @@ class RunCommandTool(Tool[RunCommandParams]):
         "cwd defaults to the Replux startup directory; a relative cwd starts there. "
         "timeout_seconds defaults to 120 and cannot exceed 600. "
         "The result keeps the last 2000 lines or 50 KiB, whichever is smaller, and gives a log path "
-        "when that shown output is truncated."
+        "when that shown output is truncated. Each command log stops at 100 MiB; "
+        "reaching that limit stops the command."
     )
     params_model = RunCommandParams
     category = "execute"
@@ -163,6 +164,8 @@ class _Capture:
                     return
                 del self._tail[:newline + 1]
                 self.cut_lines = True
+                # Dropping through a newline removes a mid-line fragment from the front.
+                self.line_fragment = False
                 continue
             if size > self._byte_limit:
                 self._drop_front(size - self._byte_limit)
@@ -265,21 +268,27 @@ def _result(
         notes.append("Changes the command already made were kept.")
         details["side_effects"] = "kept"
     if capture.cut_lines or capture.cut_bytes:
-        kept: list[str] = []
+        kept_parts: list[str] = []
         if capture.cut_lines:
-            kept.append(f"the last {line_limit} lines")
+            kept_parts.append(f"the last {line_limit} lines")
         if capture.cut_bytes:
-            kept.append(f"the last {_byte_text(byte_limit)}")
+            kept_parts.append(f"the last {_byte_text(byte_limit)}")
+        kept = " and ".join(kept_parts)
         fragment = " The first line shown is only the tail of a longer line." if capture.line_fragment else ""
-        if limited:
-            notes.append(
-                f"Shown output is {' and '.join(kept)} of the captured prefix.{fragment} "
-                f"That prefix is in {log_path}."
+        if capture.cut_lines and capture.cut_bytes and not capture.line_fragment:
+            note = (
+                f"Shown output is the last {line_limit} lines. "
+                f"The output also exceeded {_byte_text(byte_limit)}."
             )
+        elif limited:
+            note = f"Shown output is {kept} of the captured prefix.{fragment}"
         else:
-            notes.append(
-                f"Shown output is {' and '.join(kept)}.{fragment} The full captured output is in {log_path}."
-            )
+            note = f"Shown output is {kept}.{fragment}"
+        if limited:
+            note += f" That prefix is in {log_path}."
+        else:
+            note += f" The full captured output is in {log_path}."
+        notes.append(note)
         details["log_path"] = str(log_path)
         if capture.cut_lines and capture.cut_bytes:
             details["truncated_by"] = "lines_and_bytes"

@@ -5,7 +5,7 @@ a command can exit while a child that ignored the first signal is still running.
 """
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -56,7 +56,6 @@ async def run_process_group(
     on_output: Callable[[bytes], bool],
     timeout_seconds: float,
     grace_seconds: float = PROCESS_TERMINATION_GRACE_SECONDS,
-    env: Mapping[str, str] | None = None,
 ) -> ProcessOutcome:
     """Run argv in its own session. stdin is closed. stdout and stderr are merged.
 
@@ -67,7 +66,6 @@ async def run_process_group(
     process = await asyncio.create_subprocess_exec(
         *argv,
         cwd=os.fspath(cwd),
-        env=None if env is None else dict(env),
         stdin=subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -100,12 +98,18 @@ async def run_process_group(
         # Closing stdout does not extend the time limit. _shield keeps cleanup running if
         # the caller is cancelled again.
         natural = _natural_eof(reader)
-        forced_timeout = await _shield(_finish_process(
+        parent = asyncio.current_task()
+        already_cancelling = cancel_requested or (parent is not None and parent.cancelling() > 0)
+        forced_timeout, saw_cancel = await _shield(_finish_process(
             process, pgid, reader, grace_seconds,
-            kill=not natural, remaining=deadline - time.monotonic(),
+            kill=(not natural) or already_cancelling,
+            remaining=deadline - time.monotonic(),
+            parent=parent,
         ))
         if forced_timeout:
             timed_out = True
+        if saw_cancel:
+            cancel_requested = True
     assert process.returncode is not None
     if not reader.done():
         raise RuntimeError(f"Command process group {pgid} exited but its output was still open.")
@@ -153,23 +157,33 @@ async def _finish_process(
     *,
     kill: bool,
     remaining: float,
-) -> bool:
-    """Stop the group when required. Return True when a closed stdout outlived the time limit."""
+    parent: asyncio.Task[object] | None,
+) -> tuple[bool, bool]:
+    """Stop the group when required.
+
+    The first flag means a closed stdout outlived the time limit.
+    The second flag means the caller cancelled during that wait.
+    """
     forced_timeout = False
+    saw_cancel = False
     if kill or not reader.done():
         await _terminate_group(process, pgid, grace_seconds)
     else:
         # stdout already closed. Reap the shell's own status, then stop any child it left behind.
+        # Poll the caller's cancel flag: this task is shielded, so its own awaits are not cancelled.
         if process.returncode is None:
             waiting = asyncio.create_task(process.wait())
-            await asyncio.wait({waiting}, timeout=max(0.0, remaining))
-            if not waiting.done():
+            reason = await _wait_for_exit(waiting, remaining, parent)
+            if reason == "timeout":
                 forced_timeout = True
+            elif reason == "cancelled":
+                saw_cancel = True
+            if reason != "done":
                 await _terminate_group(process, pgid, grace_seconds)
             if not waiting.done():
                 await waiting
             waiting.result()
-        if not forced_timeout and _group_alive(pgid):
+        if not forced_timeout and not saw_cancel and _group_alive(pgid):
             await _terminate_group(process, pgid, grace_seconds)
     while not reader.done():
         await asyncio.wait({reader})
@@ -177,7 +191,22 @@ async def _finish_process(
         await process.wait()
     if _group_alive(pgid):
         raise RuntimeError(f"Process group {pgid} is still running after cleanup.")
-    return forced_timeout
+    return forced_timeout, saw_cancel
+
+
+async def _wait_for_exit(
+    waiting: asyncio.Task[int], timeout: float, parent: asyncio.Task[object] | None,
+) -> str:
+    deadline = time.monotonic() + max(0.0, timeout)
+    while not waiting.done():
+        if parent is not None and parent.cancelling() > 0:
+            return "cancelled"
+        pause = deadline - time.monotonic()
+        if pause <= 0:
+            return "timeout"
+        await asyncio.sleep(min(_POLL_SECONDS, pause))
+    waiting.result()
+    return "done"
 
 
 async def _terminate_group(process: asyncio.subprocess.Process, pgid: int, grace_seconds: float) -> None:
