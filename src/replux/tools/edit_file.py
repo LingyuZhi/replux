@@ -80,8 +80,9 @@ def _edit(
         hold.entered.set()
         hold.release.wait()
     checkpoint()
-    if _bytes_changed(path, original):
-        return _file_changed(path)
+    blocked = _reject_changed_file(path, original)
+    if blocked is not None:
+        return blocked
     data = text.encode("utf-8")
     commit_hold = hold if hold is not None and hold.stage == "during" else None
     try:
@@ -137,17 +138,25 @@ def _stopped(path: Path, status: str, lead: str) -> ToolResult:
     return error_result("timeout", f"{lead} {sentence}", path=str(path), file_state=state)
 
 
-def _bytes_changed(path: Path, original: bytes) -> bool:
+def _reject_changed_file(path: Path, original: bytes) -> ToolResult | None:
+    """Return an error when the on-disk bytes are no longer the ones that were edited."""
     try:
-        if path.is_dir() or not path.is_file():
-            return True
-        return path.read_bytes() != original
-    except OSError:
-        return True
-
-
-def _file_changed(path: Path) -> ToolResult:
+        changed = path.is_dir() or not path.is_file() or path.read_bytes() != original
+    except PermissionError:
+        return error_result(
+            "permission_denied", f"Permission denied: {path}. The edit was not written.", path=str(path),
+        )
+    except OSError as error:
+        return error_result(
+            "read_failed",
+            f"Cannot read {path}: {error.strerror or 'unknown error'}. The edit was not written.",
+            path=str(path),
+        )
+    if not changed:
+        return None
     state, sentence = describe_commit(path)
+    if state == "absent":
+        sentence = f"{path} is absent and was not recreated."
     return error_result(
         "file_changed",
         f"{path} changed after it was read and was not overwritten. {sentence}",

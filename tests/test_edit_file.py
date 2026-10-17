@@ -380,6 +380,50 @@ async def test_cancel_during_commit_finishes_the_edit(tmp_path: Path) -> None:
     assert list(tmp_path.glob(".replux-*")) == []
 
 
+async def test_a_file_removed_after_the_read_is_not_recreated(tmp_path: Path) -> None:
+    target = tmp_path / "a.txt"
+    target.write_bytes(b"hello")
+    hold = CommitHold("before")
+    registry = ToolRegistry()
+    registry.register(EditFileTool(tmp_path, hold=hold))
+    running = asyncio.create_task(edit(registry, path="a.txt", edits=[
+        {"old_text": "hello", "new_text": "there"},
+    ]))
+    assert await asyncio.to_thread(hold.entered.wait, 2)
+    target.unlink()
+    hold.release.set()
+    result = await asyncio.wait_for(running, timeout=2)
+    assert (result.status, result.error_code, result.details["file_state"]) == ("error", "file_changed", "absent")
+    assert "was not recreated" in result.output
+    assert "was not created" not in result.output
+    assert not target.exists()
+    assert list(tmp_path.glob(".replux-*")) == []
+
+
+async def test_a_permission_change_after_the_read_is_not_reported_as_file_changed(tmp_path: Path) -> None:
+    if os.geteuid() == 0:
+        pytest.skip("root can read without permission bits")
+    target = tmp_path / "a.txt"
+    target.write_bytes(b"hello")
+    hold = CommitHold("before")
+    registry = ToolRegistry()
+    registry.register(EditFileTool(tmp_path, hold=hold))
+    running = asyncio.create_task(edit(registry, path="a.txt", edits=[
+        {"old_text": "hello", "new_text": "there"},
+    ]))
+    assert await asyncio.to_thread(hold.entered.wait, 2)
+    target.chmod(0o000)
+    try:
+        hold.release.set()
+        result = await asyncio.wait_for(running, timeout=2)
+    finally:
+        target.chmod(0o644)
+    assert (result.status, result.error_code) == ("error", "permission_denied")
+    assert "file_changed" not in result.output
+    assert target.read_bytes() == b"hello"
+    assert list(tmp_path.glob(".replux-*")) == []
+
+
 async def test_an_external_change_is_kept_when_it_matches_the_edited_bytes(tmp_path: Path) -> None:
     target = tmp_path / "a.txt"
     target.write_bytes(b"hello")
