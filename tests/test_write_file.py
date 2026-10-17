@@ -220,8 +220,9 @@ async def test_permission_denied_reports_the_unchanged_file_and_removes_the_temp
         result = await write(create_default_registry(tmp_path), path="locked/a.txt", content="new")
     finally:
         parent.chmod(0o755)
-    assert (result.status, result.error_code, result.details["file_state"]) == ("error", "permission_denied", "unchanged")
-    assert "previous 3 bytes" in result.output
+    assert (result.status, result.error_code, result.details["file_state"]) == ("error", "permission_denied", "not_replaced")
+    assert "was not replaced. It contains 3 bytes." in result.output
+    assert "previous" not in result.output
     assert target.read_text(encoding="utf-8") == "old"
     assert list(parent.glob(".replux-*")) == []
 
@@ -278,9 +279,9 @@ async def test_timeout_before_commit_leaves_the_previous_bytes_and_no_temp(tmp_p
     assert list(tmp_path.glob(".replux-*")) == []
     hold.release.set()
     result = await asyncio.wait_for(running, timeout=2)
-    assert (result.status, result.error_code, result.details["file_state"]) == ("error", "timeout", "unchanged")
+    assert (result.status, result.error_code, result.details["file_state"]) == ("error", "timeout", "not_replaced")
     assert "0.05 seconds" in result.output
-    assert "previous 3 bytes" in result.output
+    assert "was not replaced. It contains 3 bytes." in result.output
     assert target.read_text(encoding="utf-8") == "old"
     assert list(tmp_path.glob(".replux-*")) == []
 
@@ -296,8 +297,10 @@ async def test_cancel_before_commit_creates_nothing(tmp_path: Path) -> None:
         await asyncio.wait_for(asyncio.shield(running), timeout=0.1)
     assert not (tmp_path / "nested").exists()
     hold.release.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(running, timeout=2)
+    result = await asyncio.wait_for(running, timeout=2)
+    assert result.status == "cancelled"
+    assert result.details["file_state"] == "absent"
+    assert "was not created" in result.output
     assert not (tmp_path / "nested").exists()
     assert list(tmp_path.glob(".replux-*")) == []
 
@@ -320,6 +323,40 @@ async def test_cancel_during_commit_finishes_the_replacement(tmp_path: Path) -> 
     assert result.status == "success"
     assert result.details["bytes"] == 3
     assert target.read_bytes() == b"new"
+    assert list(tmp_path.glob(".replux-*")) == []
+
+
+async def test_a_failed_replace_reports_the_bytes_now_on_disk_not_the_old_ones(tmp_path: Path) -> None:
+    target = tmp_path / "a.txt"
+    target.write_bytes(b"old")
+    hold = CommitHold("during")
+    registry = ToolRegistry()
+    registry.register(WriteFileTool(tmp_path, hold=hold))
+    running = asyncio.create_task(write(registry, path="a.txt", content="new"))
+    assert await asyncio.to_thread(hold.entered.wait, 2)
+    target.write_bytes(b"zzzzzzz")
+    temps = list(tmp_path.glob(".replux-*"))
+    assert len(temps) == 1
+    temps[0].unlink()
+    hold.release.set()
+    result = await asyncio.wait_for(running, timeout=2)
+    assert (result.status, result.error_code, result.details["file_state"]) == ("error", "write_failed", "not_replaced")
+    assert "contains 7 bytes" in result.output
+    assert "previous" not in result.output
+    assert target.read_bytes() == b"zzzzzzz"
+    assert list(tmp_path.glob(".replux-*")) == []
+
+
+async def test_a_symlink_loop_is_left_in_place(tmp_path: Path) -> None:
+    link = tmp_path / "a"
+    other = tmp_path / "b"
+    link.symlink_to("b")
+    other.symlink_to("a")
+    result = await write(create_default_registry(tmp_path), path="a", content="x")
+    assert os.readlink(link) == "b"
+    assert os.readlink(other) == "a"
+    assert (result.status, result.error_code, result.details["file_state"]) == ("error", "write_failed", "symlink")
+    assert "still a symlink" in result.output
     assert list(tmp_path.glob(".replux-*")) == []
 
 
@@ -543,6 +580,8 @@ async def test_cancelling_a_turn_keeps_only_a_commit_that_already_started(
     if stage == "before":
         assert target.read_bytes() == b"old"
         assert finished.result.status == "cancelled"
+        assert finished.result.details["file_state"] == "not_replaced"
+        assert "was not replaced" in finished.result.output
     else:
         assert target.read_bytes() == b"new"
         assert finished.result.status == "success"

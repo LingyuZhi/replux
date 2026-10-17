@@ -1,7 +1,7 @@
 """Create or replace a UTF-8 text file."""
 
+import asyncio
 from collections.abc import Callable
-import os
 from pathlib import Path
 
 from pydantic import Field
@@ -10,7 +10,7 @@ from replux.tools.base import (
     FILE_OPERATION_TIMEOUT_SECONDS, FileOperationTimeout, Tool, ToolParams, ToolResult, error_result,
     run_file_operation,
 )
-from replux.tools.commit import CommitHold, commit_file
+from replux.tools.commit import CommitHold, commit_file, target_file
 
 
 class WriteFileParams(ToolParams):
@@ -44,12 +44,9 @@ class WriteFileTool(Tool[WriteFileParams]):
                 timeout_seconds=self.timeout_seconds,
             )
         except FileOperationTimeout:
-            state, sentence = _describe(target, data)
-            return error_result(
-                "timeout",
-                f"Writing {target} did not finish within {self.timeout_seconds:g} seconds. {sentence}",
-                path=str(target), file_state=state,
-            )
+            return _stopped(target, data, "timeout", f"Writing {target} did not finish within {self.timeout_seconds:g} seconds.")
+        except asyncio.CancelledError:
+            return _stopped(target, data, "cancelled", f"Cancelled while writing {target}.")
 
 
 def _write(target: Path, data: bytes, checkpoint: Callable[[], None], hold: CommitHold | None) -> ToolResult:
@@ -58,7 +55,7 @@ def _write(target: Path, data: bytes, checkpoint: Callable[[], None], hold: Comm
     except OSError as error:
         state, sentence = _describe(target, data)
         return error_result(
-            _code(error, state),
+            _error_code(error, state),
             f"Cannot write {target}: {error.strerror or 'unknown error'}. {sentence}",
             path=str(target), file_state=state,
         )
@@ -67,7 +64,14 @@ def _write(target: Path, data: bytes, checkpoint: Callable[[], None], hold: Comm
     )
 
 
-def _code(error: OSError, state: str) -> str:
+def _stopped(target: Path, data: bytes, status: str, lead: str) -> ToolResult:
+    state, sentence = _describe(target, data)
+    if status == "cancelled":
+        return ToolResult("cancelled", f"{lead} {sentence}", details={"path": str(target), "file_state": state})
+    return error_result("timeout", f"{lead} {sentence}", path=str(target), file_state=state)
+
+
+def _error_code(error: OSError, state: str) -> str:
     if state == "directory" or isinstance(error, IsADirectoryError):
         return "not_a_file"
     if isinstance(error, PermissionError):
@@ -79,14 +83,16 @@ def _code(error: OSError, state: str) -> str:
 
 def _describe(path: Path, intended: bytes) -> tuple[str, str]:
     try:
-        probe = Path(os.path.realpath(path)) if path.is_symlink() else path
+        probe = target_file(path)
         if probe.is_dir():
             return "directory", f"{probe} is a directory and was not replaced."
         if not probe.exists():
             return "absent", f"{probe} was not created."
         current = probe.read_bytes()
     except OSError as error:
+        if path.is_symlink():
+            return "symlink", f"{path} is still a symlink and was not replaced."
         return "unknown", f"The state of {path} could not be read: {error.strerror or 'unknown error'}."
     if current == intended:
         return "written", f"{probe} contains the new {len(intended)} bytes."
-    return "unchanged", f"{probe} still has its previous {len(current)} bytes."
+    return "not_replaced", f"{probe} was not replaced. It contains {len(current)} bytes."

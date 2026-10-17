@@ -40,7 +40,7 @@ def commit_file(
         hold.entered.set()
         hold.release.wait()
     checkpoint()
-    destination = Path(os.path.realpath(path)) if path.is_symlink() else path
+    destination = target_file(path)
     if destination.is_dir():
         raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), str(destination))
     _ensure_parent(destination)
@@ -61,10 +61,20 @@ def commit_file(
         replaced = True
     finally:
         if not replaced:
-            try:
-                os.unlink(temp)
-            except FileNotFoundError:
-                pass
+            temp.unlink(missing_ok=True)
+
+
+def target_file(path: Path) -> Path:
+    """Return the file a write replaces. A symlink resolves to its target.
+
+    A symlink loop has no target file. Raising here leaves the link in place.
+    """
+    if not path.is_symlink():
+        return path
+    resolved = Path(os.path.realpath(path))
+    if resolved.is_symlink():
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
+    return resolved
 
 
 def _ensure_parent(destination: Path) -> None:
