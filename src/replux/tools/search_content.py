@@ -122,13 +122,25 @@ class SearchContentTool(Tool[SearchContentParams]):
                 "The search process was stopped.",
                 path=str(target),
             )
-        if capture.reason is None and outcome.return_code not in {0, 1}:
+        # A limit only shortens a finished search. A read or pattern error still wins,
+        # including when the matching lines already reached the limit.
+        if outcome.return_code not in {0, 1}:
             message = capture.error_text() or f"ripgrep exited with status {outcome.return_code}."
             return error_result(_failure_code(message), f"Cannot search {target}: {message}", path=str(target))
+        if capture.encoding_error is not None:
+            return error_result(
+                "unsupported_encoding",
+                f"{capture.encoding_error} is not valid UTF-8 text; other encodings are not supported.",
+                path=str(target),
+            )
+        if capture.unparsed:
+            return error_result(
+                "search_failed",
+                f"Cannot search {target}: ripgrep returned a result that could not be read.",
+                path=str(target),
+            )
         return _format_matches(
-            capture.shown, target,
-            limit=params.limit, byte_limit=self.byte_limit, reason=capture.reason,
-            binary_skipped=capture.binary_skipped,
+            capture.shown, target, limit=params.limit, byte_limit=self.byte_limit, reason=capture.reason,
         )
 
 
@@ -147,91 +159,103 @@ class _Capture:
     def __init__(self, limit: int, byte_limit: int) -> None:
         self.shown: list[str] = []
         self.reason: str | None = None
-        self.binary_skipped = False
+        self.encoding_error: str | None = None
+        self.unparsed = False
         self._limit = limit
         self._byte_limit = byte_limit
         self._used = 0
-        self._armed = False
+        self._count_reached = False
         self._mode = "path"
         self._path = bytearray()
         self._line = bytearray()
-        self._head = bytearray()
-        self._tail = bytearray()
+        self._error_prefix = bytearray()
+        self._error_suffix = bytearray()
 
     def add(self, chunk: bytes) -> bool:
+        """Keep the pipe draining after the result limit so ripgrep can exit on its own."""
         self._remember(chunk)
-        if self.reason is not None:
-            return False
         for byte in chunk:
-            if not self._feed(byte):
-                return False
+            self._feed(byte)
         return True
 
     def error_text(self) -> str:
-        data = bytes(self._head)
-        tail = bytes(self._tail)
-        if tail and tail not in data:
-            data = data + b"\n" + tail
+        data = bytes(self._error_prefix)
+        suffix = bytes(self._error_suffix)
+        if suffix and suffix not in data:
+            data = data + b"\n" + suffix
         return _error_text(data)
 
     def _remember(self, chunk: bytes) -> None:
-        if len(self._head) < 8000:
-            self._head.extend(chunk[:8000 - len(self._head)])
-        self._tail.extend(chunk)
-        if len(self._tail) > 8000:
-            del self._tail[:len(self._tail) - 8000]
+        if len(self._error_prefix) < 8000:
+            self._error_prefix.extend(chunk[:8000 - len(self._error_prefix)])
+        self._error_suffix.extend(chunk)
+        if len(self._error_suffix) > 8000:
+            del self._error_suffix[:len(self._error_suffix) - 8000]
 
-    def _feed(self, byte: int) -> bool:
+    def _feed(self, byte: int) -> None:
+        if self.reason is not None or self.encoding_error is not None or self.unparsed:
+            return
         if self._mode == "skip":
             if byte == 10:
-                return self._finish_line()
-            return True
+                self._finish_line()
+            return
         if self._mode == "path":
             if byte == 0:
-                if self._armed:
+                if self._count_reached:
                     self.reason = "count"
-                    return False
+                    return
                 self._mode = "line"
                 self._line.clear()
-                return True
+                return
             if byte == 10:
-                if b"binary file matches" in self._path:
-                    self.binary_skipped = True
                 self._path.clear()
-                return True
+                return
             self._path.append(byte)
-            return True
+            return
         if byte == 10:
-            return self._finish_line()
+            self._finish_line()
+            return
         self._line.append(byte)
         if len(self._line) > _LINE_BYTE_CAP:
             self._mode = "skip"
-        return True
 
-    def _finish_line(self) -> bool:
+    def _finish_line(self) -> None:
         self._mode = "path"
         if self._line.endswith(b"\n"):
             del self._line[-1]
-        parsed = _split_match(bytes(self._line))
+        raw_line = bytes(self._line)
+        parsed = _split_match(raw_line)
         path = _clean_path(bytes(self._path))
         self._path.clear()
         self._line.clear()
-        if parsed is None or not path:
-            return True
-        return self._offer(path, parsed[0], parsed[1])
+        if parsed is None:
+            if path and raw_line:
+                self.unparsed = True
+            return
+        number, content_bytes = parsed
+        if content_bytes.endswith(b"\r"):
+            content_bytes = content_bytes[:-1]
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            self.encoding_error = path or str(path)
+            return
+        self._offer(path, number, content)
 
-    def _offer(self, path: str, number: int, content: str) -> bool:
+    def _offer(self, path: str, number: int, content: str) -> None:
+        if not path:
+            self.unparsed = True
+            return
         line = _format_line(path, number, content)
         encoded = line.encode("utf-8")
         extra = len(encoded) if not self.shown else len(encoded) + 1
         if self._used + extra > self._byte_limit:
             self.reason = "bytes"
-            return False
+            return
         self.shown.append(line)
         self._used += extra
         if len(self.shown) >= self._limit:
-            self._armed = True
-        return True
+            self._count_reached = True
 
 
 def _argv(
@@ -258,7 +282,7 @@ def _clean_path(raw: bytes) -> str:
     return text
 
 
-def _split_match(raw: bytes) -> tuple[int, str] | None:
+def _split_match(raw: bytes) -> tuple[int, bytes] | None:
     colon = raw.find(b":")
     if colon <= 0:
         return None
@@ -268,10 +292,7 @@ def _split_match(raw: bytes) -> tuple[int, str] | None:
         return None
     if number < 1:
         return None
-    content = raw[colon + 1:].decode("utf-8", errors="replace")
-    if content.endswith("\r"):
-        content = content[:-1]
-    return number, content
+    return number, raw[colon + 1:]
 
 
 def _format_line(path: str, number: int, content: str) -> str:
@@ -281,14 +302,13 @@ def _format_line(path: str, number: int, content: str) -> str:
 
 
 def _format_matches(
-    shown: list[str], target: Path, *, limit: int, byte_limit: int, reason: str | None, binary_skipped: bool,
+    shown: list[str], target: Path, *, limit: int, byte_limit: int, reason: str | None,
 ) -> ToolResult:
     details: dict[str, object] = {"path": str(target), "count": len(shown)}
     if reason is not None:
         details["truncated_by"] = reason
     if not shown and reason is None:
-        notice = " Binary content was skipped." if binary_skipped else ""
-        return ToolResult("success", f"No matches in {target}.{notice}", details=details)
+        return ToolResult("success", f"No matches in {target}.", details=details)
     note = _note(shown, target=target, limit=limit, byte_limit=byte_limit, reason=reason)
     body = "\n".join(shown)
     output = f"{body}\n\n{note}" if body else note

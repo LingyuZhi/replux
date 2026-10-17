@@ -185,7 +185,7 @@ async def test_an_explicit_file_is_searched_and_binary_content_is_skipped(tmp_pa
         "\n"
         f"1 match in {project / '.hidden.txt'}."
     )
-    assert binary.output == f"No matches in {project / 'data.bin'}. Binary content was skipped."
+    assert binary.output == f"No matches in {project / 'data.bin'}."
     assert binary.error_code is None
     assert binary.details["count"] == 0
     assert linked.output == (
@@ -239,6 +239,26 @@ async def test_invalid_regex_and_read_failures_are_explicit_errors(tmp_path: Pat
     assert denied.error_code == "permission_denied"
     assert "Permission denied" in denied.output
     assert "notes.txt:1:alpha" not in denied.output
+    lines = "".join(f"m{number}\n" for number in range(101))
+    (tmp_path / "many.txt").write_text(lines, encoding="utf-8")
+    os.chmod(blocked, 0)
+    try:
+        truncated = await search(registry, pattern="m", limit=1)
+    finally:
+        os.chmod(blocked, 0o755)
+    assert truncated.status == "error"
+    assert truncated.error_code == "permission_denied"
+    assert "truncated_by" not in truncated.details
+    assert "Showing the first" not in truncated.output
+
+
+async def test_a_match_that_is_not_utf8_is_an_error(tmp_path: Path) -> None:
+    (tmp_path / "notes.txt").write_bytes(b"caf\xe9\n")
+    result = await search(create_default_registry(tmp_path), pattern="caf")
+    assert result.status == "error"
+    assert result.error_code == "unsupported_encoding"
+    assert "not valid UTF-8" in result.output
+    assert "\ufffd" not in result.output
 
 
 @pytest.mark.parametrize("arguments", [
