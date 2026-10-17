@@ -10,6 +10,7 @@ from replux.tools.edit_file import EditFileTool
 from replux.tools.find_files import FindFilesTool
 from replux.tools.read_file import ReadFileTool
 from replux.tools.run_command import RunCommandTool
+from replux.tools.search_content import SearchContentTool
 from replux.tools.session import SessionDirectory
 from replux.tools.write_file import WriteFileTool
 
@@ -31,4 +32,5 @@ def create_default_registry(
     registry.register(EditFileTool(root))
     registry.register(RunCommandTool(root, session, bash=bash))
     registry.register(FindFilesTool(root, ripgrep=ripgrep))
+    registry.register(SearchContentTool(root, ripgrep=ripgrep))
     return registry
