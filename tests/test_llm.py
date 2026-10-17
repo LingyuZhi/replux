@@ -129,6 +129,13 @@ async def test_text_arrives_before_completion_and_completion_waits_for_cleanup(
             "model": "custom-model-20261001",
             "input": [{"role": "user", "content": "  你好，Replux  "}],
             "stream": True, "store": False,
+            "tools": [
+                {
+                    "type": "function", "name": tool.name, "description": tool.description,
+                    "parameters": tool.input_schema, "strict": False,
+                }
+                for tool in create_default_registry(Path.cwd()).definitions()
+            ],
         }
     assert request.extensions["timeout"] == {
         "connect": 5, "read": 600, "write": 600, "pool": 600
@@ -251,7 +258,7 @@ async def test_openai_terminal_failure_closes_without_waiting_for_eof(terminal: 
 @pytest.mark.parametrize("failure", ["eof", "text_done", "status", "tool_item", "tool_final", "incomplete_message"])
 async def test_openai_requires_a_completed_supported_response(failure: str) -> None:
     events = reply_events("openai")
-    tool = {"id": "fc_offline", "type": "function_call", "call_id": "call_offline", "name": "unavailable", "arguments": "{}", "status": "completed"}
+    custom_tool = {"id": "ctc_offline", "type": "custom_tool_call", "call_id": "call_offline", "name": "unavailable", "input": ""}
     if failure == "eof":
         events.pop()
     elif failure == "text_done":
@@ -259,9 +266,9 @@ async def test_openai_requires_a_completed_supported_response(failure: str) -> N
     elif failure == "status":
         events[-1]["response"]["status"] = "incomplete"
     elif failure == "tool_item":
-        events[2]["item"] = tool
+        events[2]["item"] = custom_tool
     elif failure == "tool_final":
-        events[-1]["response"]["output"] = [tool]
+        events[-1]["response"]["output"] = [custom_tool]
     else:
         events[-1]["response"]["output"][0]["status"] = "incomplete"
     stream = ControlledSSE(events)
@@ -312,7 +319,7 @@ async def test_openai_replays_complete_output_without_displaying_reasoning() -> 
         *events[-1]["response"]["output"],
         {"role": "user", "content": "follow-up"},
     ]
-    assert set(request) == {"model", "input", "stream", "store"}
+    assert set(request) == {"model", "input", "tools", "stream", "store"}
     assert request["store"] is False
     assert stream.closed
     assert follow_up.closed

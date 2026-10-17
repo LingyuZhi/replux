@@ -24,7 +24,7 @@ async def test_next_request_replays_each_completed_turn(protocol: str, refusal: 
             assert request[field] == expected
             assert set(request) == (
                 {"model", "messages", "max_tokens", "tools", "stream"} if protocol == "anthropic"
-                else {"model", "input", "stream", "store"}
+                else {"model", "input", "tools", "stream", "store"}
             )
             stop_reason = ("refusal" if refusal else "end_turn") if protocol == "anthropic" else "completed"
             chunks = ["抱歉，", "无法回答。\n"] if refusal else ["你好", "，世界\n"]
@@ -129,9 +129,12 @@ async def test_unfinished_turn_preserves_previously_completed_history(protocol: 
         with pytest.raises(IncompleteReplyError) as caught:
             async for event in client.stream_reply("unfinished"):
                 received.append(event)
-        if ending.startswith("tool_"):
-            expected = "tool request is incomplete" if protocol == "anthropic" else "tool requests are not supported"
-            assert expected in str(caught.value)
+        if ending == "tool_terminal" and protocol == "anthropic":
+            assert "tool request is incomplete" in str(caught.value)
+        elif ending == "tool_request":
+            assert "final completion signal is missing" in str(caught.value)
+        elif ending == "tool_terminal":
+            assert "tool request is unfinished" in str(caught.value)
         assert received == [TextDelta("你好"), TextDelta("，世界\n")]
         _ = [event async for event in client.stream_reply("follow-up")]
     field = "messages" if protocol == "anthropic" else "input"

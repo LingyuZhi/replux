@@ -1,6 +1,7 @@
 import asyncio
 from collections.abc import AsyncGenerator
 from html import unescape
+import json
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ from replux.cli import create_app
 from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta, ToolFinished, ToolStarted
 from replux.tools import ToolResult
 from replux.tui import RepluxApp, ToolCallView
-from tests.support import ControlledSSE, RecordingTransport, reply_events, tool_use_events
+from tests.support import ControlledSSE, RecordingTransport, function_call_events, reply_events, tool_use_events
 from tests.test_config import VALID_YAML
 
 
@@ -172,15 +173,17 @@ async def test_cancelling_a_running_tool_stops_its_animation() -> None:
         assert app.query_one("#status", Static).content == "Ready"
 
 
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
 async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_completes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
 ) -> None:
     config = tmp_path / "provider.yaml"
-    config.write_text(VALID_YAML, encoding="utf-8")
+    config.write_text(VALID_YAML.replace("protocol: anthropic", f"protocol: {protocol}"), encoding="utf-8")
     (tmp_path / "notes.txt").write_text("".join(f"line {number}\n" for number in range(1, 9)), encoding="utf-8")
     monkeypatch.chdir(tmp_path)
-    summary = ControlledSSE(reply_events(), gate_after=0)
-    transport = RecordingTransport([ControlledSSE(tool_use_events()), summary])
+    tool_events = tool_use_events() if protocol == "anthropic" else function_call_events()
+    summary = ControlledSSE(reply_events(protocol), gate_after=0)
+    transport = RecordingTransport([ControlledSSE(tool_events), summary])
     app = create_app(["--config", str(config)], transport=transport)
     async with app.run_test(size=(80, 40)) as pilot:
         app.query_one("#prompt", TextArea).text = "读一下 notes.txt"
@@ -203,3 +206,19 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["我先读文件。", "你好，世界\n"]
     assert len(transport.requests) == 2
     assert transport.closed
+    first, summary_request = (json.loads(request.content) for request in transport.requests)
+    endpoint = "v1/messages" if protocol == "anthropic" else "responses"
+    assert str(transport.requests[0].url).endswith("/" + endpoint)
+    assert str(transport.requests[1].url).endswith("/" + endpoint)
+    assert first["tools"][0]["name"] == "read_file"
+    if protocol == "anthropic":
+        assert first["tools"][0]["input_schema"]["properties"]["path"]["minLength"] == 1
+        assert "tool_choice" not in first
+        assert summary_request["tool_choice"] == {"type": "none"}
+    else:
+        assert first["tools"][0]["type"] == "function"
+        assert first["tools"][0]["parameters"]["properties"]["path"]["minLength"] == 1
+        assert first["tools"][0]["strict"] is False
+        assert "tool_choice" not in first
+        assert summary_request["tool_choice"] == "none"
+        assert summary_request["store"] is False

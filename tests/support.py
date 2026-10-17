@@ -142,6 +142,82 @@ def tool_use_events(
     ]
 
 
+def function_call_events(
+    calls: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
+        ("fc_notes", "call_notes", "read_file", ('{"path": ', '"notes.txt"}')),
+    ),
+    *,
+    completed_arguments: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Responses SSE with reasoning, text, and function calls whose arguments arrive in pieces.
+
+    Pieces for different output items are interleaved. completed_arguments replaces only the
+    arguments on the finished output items, so a test can show execution uses the pieces.
+    """
+    stored = tuple("".join(pieces) for _, _, _, pieces in calls) if completed_arguments is None else completed_arguments
+    reasoning = {
+        "id": "rs_offline", "type": "reasoning", "status": "completed",
+        "summary": [{"type": "summary_text", "text": "offline reasoning summary"}],
+        "encrypted_content": "opaque-offline-data",
+    }
+    text = "我先读文件。"
+    part = {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
+    message = {
+        "id": "msg_offline", "type": "message", "role": "assistant", "status": "completed",
+        "phase": "commentary", "content": [part],
+    }
+    function_items = [
+        {
+            "id": item_id, "type": "function_call", "call_id": call_id, "name": name,
+            "arguments": arguments, "status": "completed",
+        }
+        for (item_id, call_id, name, _), arguments in zip(calls, stored, strict=True)
+    ]
+    response = {
+        "id": "resp_offline", "object": "response", "created_at": 1, "status": "completed",
+        "model": "custom-model-20261001", "output": [reasoning, message, *function_items],
+        "error": None, "incomplete_details": None, "parallel_tool_calls": True,
+        "tool_choice": "auto", "tools": [],
+        "usage": {
+            "input_tokens": 11, "output_tokens": 5, "total_tokens": 16,
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        },
+    }
+    position = {"item_id": "msg_offline", "output_index": 1, "content_index": 0}
+    events: list[dict[str, Any]] = [
+        {"type": "response.created", "response": {**response, "status": "in_progress", "output": [], "usage": None}},
+        {"type": "response.in_progress", "response": {**response, "status": "in_progress", "output": [], "usage": None}},
+        {"type": "response.output_item.added", "output_index": 0, "item": {**reasoning, "status": "in_progress", "summary": [], "encrypted_content": None}},
+        {"type": "response.output_item.done", "output_index": 0, "item": reasoning},
+        {"type": "response.output_item.added", "output_index": 1, "item": {**message, "status": "in_progress", "content": []}},
+        {"type": "response.content_part.added", **position, "part": {**part, "text": ""}},
+        {"type": "response.output_text.delta", **position, "delta": text, "logprobs": []},
+        {"type": "response.output_text.done", **position, "text": text, "logprobs": []},
+        {"type": "response.content_part.done", **position, "part": part},
+        {"type": "response.output_item.done", "output_index": 1, "item": message},
+    ]
+    for index, item in enumerate(function_items):
+        events.append({
+            "type": "response.output_item.added", "output_index": index + 2,
+            "item": {**item, "status": "in_progress", "arguments": ""},
+        })
+    piece_count = max(len(pieces) for _, _, _, pieces in calls)
+    for piece_index in range(piece_count):
+        for index, (item_id, _, _, pieces) in enumerate(calls):
+            if piece_index < len(pieces):
+                events.append({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": item_id, "output_index": index + 2, "delta": pieces[piece_index],
+                })
+    for index, item in enumerate(function_items):
+        events.append({"type": "response.output_item.done", "output_index": index + 2, "item": item})
+    events.append({"type": "response.completed", "response": response})
+    for sequence_number, event in enumerate(events):
+        event["sequence_number"] = sequence_number
+    return events
+
+
 def native_tool_use(arguments: dict[str, Any], *, name: str = "read_file", call_id: str = "toolu_read") -> dict[str, Any]:
     return {"role": "assistant", "content": [
         {"type": "thinking", "thinking": "先看文件", "signature": "tool-signature+/="},
@@ -159,14 +235,21 @@ def unfinished_events(protocol: str, ending: str) -> list[dict[str, Any]]:
     if protocol == "anthropic":
         reasons = {"output_limit": "max_tokens", "incomplete": "pause_turn", "tool_terminal": "tool_use"}
         events[-2]["delta"]["stop_reason"] = reasons[ending]
-    elif ending in {"tool_request", "tool_terminal"}:
-        tool = {"id": "fc_offline", "type": "function_call", "call_id": "call_offline", "name": "unavailable", "arguments": "{}", "status": "completed"}
+    elif ending == "tool_request":
+        tool = {"id": "fc_offline", "type": "function_call", "call_id": "call_offline", "name": "read_file", "arguments": "", "status": "in_progress"}
+        done = {**tool, "arguments": '{"path": "notes.txt"}', "status": "completed"}
+        events[-1:-1] = [
+            {"type": "response.output_item.added", "output_index": 1, "item": tool},
+            {"type": "response.function_call_arguments.delta", "item_id": "fc_offline", "output_index": 1, "delta": '{"path": "notes.txt"}'},
+            {"type": "response.output_item.done", "output_index": 1, "item": done},
+        ]
+        events.pop()
+    elif ending == "tool_terminal":
+        tool = {
+            "id": "fc_offline", "type": "function_call", "call_id": "call_offline",
+            "name": "read_file", "arguments": "{}", "status": "incomplete",
+        }
         events[-1]["response"]["output"].append(tool)
-        if ending == "tool_request":
-            events[-1:-1] = [
-                {"type": "response.output_item.added", "output_index": 1, "item": {**tool, "status": "in_progress", "arguments": ""}},
-                {"type": "response.output_item.done", "output_index": 1, "item": tool},
-            ]
     else:
         reasons = {"output_limit": "max_output_tokens", "incomplete": "content_filter"}
         events[-1]["type"] = "response.incomplete"

@@ -15,7 +15,7 @@ from anthropic import APIConnectionError, APIError, APITimeoutError, AsyncAnthro
 from anthropic.types import ContentBlock, MessageParam, ToolParam
 import httpx2 as httpx
 import openai
-from openai.types.responses import Response
+from openai.types.responses import FunctionToolParam, Response
 from openai.types.responses.response_input_param import ResponseInputItemParam
 
 from replux.config import DEFAULT_ANTHROPIC_MAX_OUTPUT_TOKENS, ProviderConfig
@@ -469,15 +469,23 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
     async def stream_response(
         self, context: list[ResponseInputItemParam], tools: Sequence[ToolDefinition], *, tools_allowed: bool,
     ) -> AsyncGenerator[ResponseEvent[ResponseInputItemParam], None]:
-        if tools:
-            raise NotImplementedError("Responses tool definitions are not supported yet.")
         try:
+            arguments: dict[int, list[str]] = {}
             final: Response | None = None
+            definitions: list[FunctionToolParam] = [
+                {
+                    "type": "function", "name": tool.name, "description": tool.description,
+                    "parameters": tool.input_schema, "strict": False,
+                }
+                for tool in tools
+            ]
             async with await self._sdk.responses.create(
                 model=self._config.model,
                 max_output_tokens=self._config.max_output_tokens if self._config.max_output_tokens is not None else openai.omit,
                 reasoning={"effort": self._config.thinking_effort} if self._config.thinking_effort is not None else openai.omit,
                 input=context,
+                tools=definitions or openai.omit,
+                tool_choice="none" if definitions and not tools_allowed else openai.omit,
                 store=False,
                 stream=True,
             ) as stream:
@@ -485,6 +493,8 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
                     _raise_if_cancelled()
                     if event.type in {"response.output_text.delta", "response.refusal.delta"}:
                         yield TextDelta(event.delta)
+                    elif event.type == "response.function_call_arguments.delta":
+                        arguments.setdefault(event.output_index, []).append(event.delta)
                     elif event.type == "response.completed":
                         final = event.response
                         break
@@ -499,16 +509,26 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
                             retry_after=stream.response.headers.get("retry-after"),
                         )
                     elif event.type in {"response.output_item.added", "response.output_item.done"}:
-                        if event.item.type not in {"message", "reasoning"}:
+                        if event.item.type not in {"message", "reasoning", "function_call"}:
                             raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
             _raise_if_cancelled()
             if final is None or final.status != "completed":
                 raise IncompleteReplyError("Reply incomplete: the final completion signal is missing.")
-            for item in final.output:
-                if item.type not in {"message", "reasoning"}:
+            calls: list[ToolCall] = []
+            for index, item in enumerate(final.output):
+                if item.type == "function_call":
+                    if item.status not in {None, "completed"}:
+                        raise IncompleteReplyError("Reply incomplete: the tool request is unfinished.")
+                    pieces = arguments.get(index, [])
+                    # Pieces belong to this output item. call_id pairs the result; the item id does not.
+                    raw = "".join(pieces) if pieces else item.arguments
+                    item.arguments = raw
+                    calls.append(ToolCall(item.call_id, item.name, raw))
+                elif item.type == "message":
+                    if item.status != "completed":
+                        raise IncompleteReplyError("Reply incomplete: the reply text is unfinished.")
+                elif item.type != "reasoning":
                     raise IncompleteReplyError("Reply incomplete: tool requests are not supported.")
-                if item.type == "message" and item.status != "completed":
-                    raise IncompleteReplyError("Reply incomplete: the reply text is unfinished.")
             usage = final.usage
             yield ModelResponse(
                 # Only replay output items; response metadata is not conversation input.
@@ -516,13 +536,17 @@ class OpenAIAdapter(ProtocolAdapter[ResponseInputItemParam]):
                 final.status,
                 getattr(usage, "input_tokens", None),
                 getattr(usage, "output_tokens", None),
+                tuple(calls),
             )
         except (openai.APIError, httpx.HTTPError) as error:
             _raise_if_cancelled()
             raise _request_error(error, thinking=self._config.thinking_effort is not None) from error
 
     def tool_results(self, results: Sequence[tuple[ToolCall, ToolResult]]) -> list[ResponseInputItemParam]:
-        raise NotImplementedError("Responses tool results are not supported yet.")
+        return [
+            {"type": "function_call_output", "call_id": call.id, "output": result.to_json()}
+            for call, result in results
+        ]
 
     async def aclose(self) -> None:
         await self._sdk.close()
@@ -535,5 +559,5 @@ def create_client(
     if config.protocol == "anthropic":
         return Conversation(AnthropicAdapter(config, transport=transport), create_default_registry(Path.cwd()))
     if config.protocol == "openai":
-        return Conversation(OpenAIAdapter(config, transport=transport), ToolRegistry())
+        return Conversation(OpenAIAdapter(config, transport=transport), create_default_registry(Path.cwd()))
     raise ValueError("Unsupported protocol; expected anthropic or openai.")

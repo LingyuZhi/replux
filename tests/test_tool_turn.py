@@ -11,7 +11,8 @@ from replux.llm import (
 )
 from replux.tools import Tool, ToolParams, ToolRegistry, ToolResult, create_default_registry
 from tests.support import (
-    ControlledSSE, RecordingTransport, native_reply, native_tool_use, provider_config, reply_events, tool_use_events,
+    ControlledSSE, RecordingTransport, function_call_events, native_reply, native_tool_use, provider_config,
+    reply_events, tool_use_events,
 )
 
 
@@ -26,6 +27,25 @@ def tool_result_message(call_id: str, result: dict[str, Any], *, is_error: bool 
     return {"role": "user", "content": [{
         "type": "tool_result", "tool_use_id": call_id, "content": result, "is_error": is_error,
     }]}
+
+
+def responses_tools(root: Path) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function", "name": tool.name, "description": tool.description,
+            "parameters": tool.input_schema, "strict": False,
+        }
+        for tool in create_default_registry(root).definitions()
+    ]
+
+
+def responses_input(request: Any) -> list[dict[str, Any]]:
+    """Request input with function_call_output text decoded from JSON."""
+    decoded = json.loads(request.content)["input"]
+    for item in decoded:
+        if item.get("type") == "function_call_output":
+            item["output"] = json.loads(item["output"])
+    return list(decoded)
 
 
 def messages(request: Any) -> list[dict[str, Any]]:
@@ -77,6 +97,201 @@ async def test_anthropic_reads_a_real_file_and_summarizes_with_tools_disabled(
     assert messages(transport.requests[2]) == [*committed, *native_reply("anthropic"), {"role": "user", "content": "follow-up"}]
     assert "tool_choice" not in follow_up
     assert all(stream.closed for stream in streams)
+
+
+async def test_responses_reads_real_files_and_pairs_results_by_call_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "notes.txt").write_text("第一行\nsecond\n", encoding="utf-8")
+    (tmp_path / "other.txt").write_text("only\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    calls = (
+        ("fc_notes", "call_notes", "read_file", ('{"path": ', '"notes.txt"}')),
+        ("fc_other", "call_other", "read_file", ('{"path": "', 'other.txt"}')),
+    )
+    # Finished output items carry different arguments, so only per-item pieces read the real files.
+    streams = [
+        ControlledSSE(function_call_events(calls, completed_arguments=('{"path":"wrong.txt"}', '{"path":"also-wrong.txt"}'))),
+        ControlledSSE(reply_events("openai")),
+        ControlledSSE(reply_events("openai")),
+    ]
+    transport = RecordingTransport(streams)
+    async with create_client(provider_config("openai"), transport=transport) as client:
+        monkeypatch.chdir(tmp_path.parent)
+        received = [event async for event in client.stream_reply("读一下 notes.txt")]
+        _ = [event async for event in client.stream_reply("follow-up")]
+
+    notes = ToolResult("success", "1\t第一行\n2\tsecond", details={
+        "path": str(tmp_path / "notes.txt"), "start_line": 1, "end_line": 2,
+    })
+    other = ToolResult("success", "1\tonly", details={
+        "path": str(tmp_path / "other.txt"), "start_line": 1, "end_line": 1,
+    })
+    durations = [event.duration_seconds for event in received if isinstance(event, ToolFinished)]
+    assert all(duration is not None for duration in durations)
+    assert received == [
+        TextDelta("我先读文件。"),
+        ToolStarted("call_notes", "read_file", "path=notes.txt"),
+        ToolFinished("call_notes", "read_file", "path=notes.txt", notes, durations[0]),
+        ToolStarted("call_other", "read_file", "path=other.txt"),
+        ToolFinished("call_other", "read_file", "path=other.txt", other, durations[1]),
+        TextDelta("你好"), TextDelta("，世界\n"), ReplyCompleted("completed", 11, 5),
+    ]
+    first, summary, follow_up = (json.loads(request.content) for request in transport.requests)
+    assert str(transport.requests[0].url).endswith("/responses")
+    assert first["tools"] == responses_tools(tmp_path)
+    assert "tool_choice" not in first
+    assert first["input"] == [{"role": "user", "content": "读一下 notes.txt"}]
+    assert first["store"] is False
+    assert summary["tools"] == first["tools"]
+    assert summary["tool_choice"] == "none"
+    assert follow_up["tools"] == first["tools"]
+    assert "tool_choice" not in follow_up
+    reasoning = {
+        "id": "rs_offline", "type": "reasoning", "status": "completed",
+        "summary": [{"type": "summary_text", "text": "offline reasoning summary"}],
+        "encrypted_content": "opaque-offline-data",
+    }
+    message = {
+        "id": "msg_offline", "type": "message", "role": "assistant", "status": "completed",
+        "phase": "commentary",
+        "content": [{"type": "output_text", "text": "我先读文件。", "annotations": [], "logprobs": []}],
+    }
+    committed = [
+        {"role": "user", "content": "读一下 notes.txt"},
+        reasoning,
+        message,
+        {
+            "id": "fc_notes", "type": "function_call", "call_id": "call_notes", "name": "read_file",
+            "arguments": '{"path": "notes.txt"}', "status": "completed",
+        },
+        {
+            "id": "fc_other", "type": "function_call", "call_id": "call_other", "name": "read_file",
+            "arguments": '{"path": "other.txt"}', "status": "completed",
+        },
+        {"type": "function_call_output", "call_id": "call_notes", "output": json.loads(notes.to_json())},
+        {"type": "function_call_output", "call_id": "call_other", "output": json.loads(other.to_json())},
+    ]
+    assert responses_input(transport.requests[1]) == committed
+    assert responses_input(transport.requests[2]) == [*committed, *native_reply("openai"), {"role": "user", "content": "follow-up"}]
+    assert all(stream.closed for stream in streams)
+
+
+async def test_responses_tool_runs_only_after_the_response_completes_and_closes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    notes = tmp_path / "notes.txt"
+    notes.write_text("while streaming\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    events = function_call_events()
+    pending = ControlledSSE(events, gate_after=len(events) - 2)
+    pending.release_close.clear()
+    transport = RecordingTransport([pending, ControlledSSE(reply_events("openai"))])
+    received: list[StreamEvent] = []
+    async with create_client(provider_config("openai"), transport=transport) as client:
+        async def consume() -> None:
+            async for event in client.stream_reply("read it"):
+                received.append(event)
+
+        consuming = asyncio.create_task(consume())
+        try:
+            await asyncio.wait_for(pending.blocked.wait(), timeout=2)
+            assert received == [TextDelta("我先读文件。")]
+            notes.write_text("while closing\n", encoding="utf-8")
+            pending.release.set()
+            await asyncio.wait_for(pending.closing.wait(), timeout=2)
+            assert received == [TextDelta("我先读文件。")]
+            notes.write_text("after cleanup\n", encoding="utf-8")
+        finally:
+            pending.release.set()
+            pending.release_close.set()
+        await asyncio.wait_for(consuming, timeout=2)
+    [finished] = [event for event in received if isinstance(event, ToolFinished)]
+    assert finished.result.output == "1\tafter cleanup"
+    assert isinstance(received[-1], ReplyCompleted)
+    assert not any(isinstance(event, ReplyCompleted) for event in received[:received.index(finished)])
+    assert len(transport.requests) == 2
+
+
+@pytest.mark.parametrize("ending", ["eof", "incomplete", "unfinished_call"])
+async def test_unfinished_responses_tool_call_executes_nothing_and_stays_out_of_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: str,
+) -> None:
+    (tmp_path / "notes.txt").write_text("content\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    events = function_call_events()
+    if ending == "eof":
+        events.pop()
+    elif ending == "unfinished_call":
+        events[-1]["response"]["output"][-1]["status"] = "incomplete"
+    else:
+        events[-1]["type"] = "response.incomplete"
+        events[-1]["response"]["status"] = "incomplete"
+        events[-1]["response"]["incomplete_details"] = {"reason": "max_output_tokens"}
+    unfinished = ControlledSSE(events)
+    transport = RecordingTransport([unfinished, ControlledSSE(reply_events("openai"))])
+    received: list[StreamEvent] = []
+    async with create_client(provider_config("openai"), transport=transport) as client:
+        with pytest.raises(IncompleteReplyError):
+            async for event in client.stream_reply("read it"):
+                received.append(event)
+        assert received == [TextDelta("我先读文件。")]
+        assert not any(isinstance(event, (ToolStarted, ToolFinished, ReplyCompleted)) for event in received)
+        _ = [event async for event in client.stream_reply("follow-up")]
+    assert unfinished.closed
+    assert responses_input(transport.requests[1]) == [{"role": "user", "content": "follow-up"}]
+
+
+async def test_incomplete_responses_summary_is_not_committed_but_tool_results_are(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "notes.txt").write_text("content\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    summary = reply_events("openai")
+    summary.pop()
+    transport = RecordingTransport([
+        ControlledSSE(function_call_events()), ControlledSSE(summary), ControlledSSE(reply_events("openai")),
+    ])
+    received: list[StreamEvent] = []
+    async with create_client(provider_config("openai"), transport=transport) as client:
+        with pytest.raises(IncompleteReplyError):
+            async for event in client.stream_reply("read it"):
+                received.append(event)
+        assert any(isinstance(event, ToolFinished) for event in received)
+        assert not any(isinstance(event, ReplyCompleted) for event in received)
+        _ = [event async for event in client.stream_reply("follow-up")]
+    history = responses_input(transport.requests[2])
+    assert history[0] == {"role": "user", "content": "read it"}
+    assert history[3]["type"] == "function_call" and history[3]["call_id"] == "call_notes"
+    assert history[3]["id"] == "fc_notes"
+    assert history[4] == {
+        "type": "function_call_output", "call_id": "call_notes",
+        "output": json.loads(ToolResult("success", "1\tcontent", details={
+            "path": str(tmp_path / "notes.txt"), "start_line": 1, "end_line": 1,
+        }).to_json()),
+    }
+    assert history[5:] == [{"role": "user", "content": "follow-up"}]
+    assert "你好" not in json.dumps(history, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("arguments", ['{"path": "notes.txt", "offset": "2"}', '{"path":'])
+async def test_responses_invalid_arguments_use_the_shared_tool_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, arguments: str,
+) -> None:
+    (tmp_path / "notes.txt").write_text("content\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    events = function_call_events((("fc_bad", "call_bad", "read_file", (arguments,)),))
+    transport = RecordingTransport([ControlledSSE(events), ControlledSSE(reply_events("openai"))])
+    async with create_client(provider_config("openai"), transport=transport) as client:
+        received = [event async for event in client.stream_reply("read it")]
+    [finished] = [event for event in received if isinstance(event, ToolFinished)]
+    assert (finished.result.status, finished.result.error_code) == ("error", "invalid_arguments")
+    assert "content" not in finished.result.output
+    assert isinstance(received[-1], ReplyCompleted)
+    assert finished.call_id == "call_bad"
+    [output] = [item for item in responses_input(transport.requests[1]) if item.get("type") == "function_call_output"]
+    assert output["call_id"] == "call_bad"
+    assert output["output"]["error_code"] == "invalid_arguments"
 
 
 @pytest.mark.parametrize("tool_call", ["missing_file", "unknown_tool", "invalid_arguments"])
