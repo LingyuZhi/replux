@@ -90,6 +90,8 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
 
         client.release[2].set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert thinking.title == "Thoughts"
+        assert not thinking.collapsed
         assert app.query_one(".reply", Static).content == "正文正常显示"
         await pilot.press("enter")
         assert thinking.collapsed
@@ -235,7 +237,7 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
         title = thinking.query_one("CollapsibleTitle", Static)
         assert thinking.collapsed
         assert "先分析" not in app.export_screenshot()
-        assert app.query_one(".reply", Static).content == ""
+        assert not app.query(".reply")
         first_request = json.loads(transport.requests[0].content)
         if configured:
             assert first_request["thinking"] == {"type": "adaptive", "display": "summarized"}
@@ -254,6 +256,7 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
             assert app.query_one(".thinking-content", Static).content == "先分析\n再回答"
             assert app.query_one(".reply", Static).content == "你好，世界\n"
             assert app.query_one("#status", Static).content == "Generating..."
+            assert thinking.title == "Thinking"
             assert not stream.closed
             await pilot.click(title, offset=(1, 0))
             assert "先分析" not in app.export_screenshot()
@@ -266,6 +269,8 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
             stream.release_close.set()
 
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        assert thinking.title == "Thoughts"
+        assert not thinking.collapsed
         prompt.focus()
         prompt.text = "follow-up"
         await pilot.press("enter")
@@ -512,16 +517,19 @@ async def test_request_error_preserves_transcript_and_draft_without_rendering_cr
         prompt.text = "follow-up"
         release_failure.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
         assert app.is_running
         assert "Request failed" in str(app.query_one(".turn-status", Static).content)
         assert app.query_one("#status", Static).content == "Ready"
         assert prompt.text == "follow-up"
         assert len(requests) == 2
+        last_user = list(app.query(".user").results(Static))[-1]
+        assert app.query_one(".turn-status").region.y == last_user.region.bottom + 1
         assert "test-secret-never-display" not in app.export_screenshot()
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert [user.content for user in app.query(".user").results(Static)] == ["first", "failed", "follow-up"]
-        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "", "你好，世界\n"]
+        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好，世界\n"]
         await pilot.press("ctrl+c")
     field = "messages" if protocol == "anthropic" else "input"
     assert len(requests) == 3
@@ -575,11 +583,15 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
         assert app.is_running
         assert app.query_one("#status", Static).content == "Ready"
         assert "Cancelled" in str(app.query_one(".turn-status", Static).content)
-        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好" if partial else ""]
+        assert [reply.content for reply in app.query(".reply").results(Static)] == (["你好，世界\n", "你好"] if partial else ["你好，世界\n"])
+        if not partial:
+            await pilot.pause()
+            last_user = list(app.query(".user").results(Static))[-1]
+            assert app.query_one(".turn-status").region.y == last_user.region.bottom + 1
         assert prompt.text == "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        assert len(app.query(".reply")) == 3
+        assert len(app.query(".reply")) == (3 if partial else 2)
         await pilot.press("ctrl+c")
     field = "messages" if protocol == "anthropic" else "input"
     assert len(transport.requests) == 3

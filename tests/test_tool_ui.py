@@ -104,11 +104,12 @@ async def test_running_tool_breathes_then_shows_status_preview_and_expandable_re
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
-        order = [
-            child.content if isinstance(child, Static) else type(child).__name__
-            for child in app.query_one("#transcript-content").children
-        ][1:]
-        assert order == ["读一下 notes.txt", "我先读文件。", "ToolCallView", "文件有八行。"]
+        user = app.query_one(".user", Static)
+        before, after = app.query(".reply").results(Static)
+        assert user.content == "读一下 notes.txt"
+        assert before.content == "我先读文件。"
+        assert after.content == "文件有八行。"
+        assert user.region.bottom < before.region.y < view.region.y < after.region.y
         assert prompt.text == "草稿"
 
 

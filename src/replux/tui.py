@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from importlib.metadata import version
 from pathlib import Path
+from typing import Literal
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -28,6 +29,28 @@ SPARK_LOGO = "\n".join((
     "  ▀▀█████▀▀  ",
     "     ▀█▀     ",
 ))
+
+
+class TranscriptMessage(Horizontal):
+    """Keep one marker beside a plain-text body, including wrapped lines."""
+
+    def __init__(self, text: str, *, role: Literal["user", "reply"]) -> None:
+        super().__init__(classes=f"message {role}-message")
+        self.body = Static(text, classes=role, markup=False)
+        self._marker = "›" if role == "user" else "●"
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._marker, classes="message-marker", markup=False)
+        yield self.body
+
+
+class ThinkingView(Collapsible):
+    """Toggle Thinking without scrolling the entire expanded block into view."""
+
+    def _watch_collapsed(self, collapsed: bool) -> None:
+        # Preserve the Transcript anchor and the user's current reading position.
+        self._update_collapsed(collapsed)
+        self.post_message(self.Collapsed(self) if collapsed else self.Expanded(self))
 
 
 class ToolCallView(Vertical):
@@ -139,18 +162,32 @@ class RepluxApp(App[None]):
     #status { height: 1; padding: 0 1; color: $text-muted; }
     #transcript { height: 1fr; padding: 1 2; }
     #transcript-content { height: auto; min-height: 100%; }
-    #startup { height: 5; margin-bottom: 1; }
+    #startup { height: 5; }
     #startup-logo { width: 13; height: 5; margin-right: 3; color: #c6b8eb; text-wrap: nowrap; }
     #startup-info { width: 1fr; height: 3; margin-top: 1; }
     #startup-info Static { height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
     #startup-model, #startup-directory { color: $text-muted; }
-    .user { margin-top: 1; color: $accent; }
-    .reply { margin: 1 0; }
+    .message { height: auto; margin-top: 1; color: $foreground; }
+    .message-marker { width: 2; height: 1; }
+    .user-message { background: $foreground 7%; }
+    .user, .reply { width: 1fr; }
+    .thinking {
+        margin: 1 0 0 2; padding: 0; border: none;
+        background: transparent;
+    }
+    .thinking:focus-within { background-tint: transparent; }
+    .thinking > CollapsibleTitle {
+        height: 1; padding: 0; color: $text-muted;
+        background: transparent; text-style: none;
+    }
+    .thinking > CollapsibleTitle:hover { color: $text; }
+    .thinking > CollapsibleTitle:focus { color: $accent; background: $boost; text-style: bold; }
+    .thinking > Contents { padding: 0; }
     .thinking-content { color: $text-muted; }
-    .turn-status { color: $warning; }
-    .tool-call { height: auto; margin: 1 0; }
+    .turn-status { margin-top: 1; color: $warning; }
+    .tool-call { height: auto; margin-top: 1; }
     .tool-heading { height: 1; }
-    .tool-dot { width: 2; color: $accent; }
+    .tool-dot { width: 2; color: $text-muted; }
     .tool-dot.error { color: $error; }
     .tool-header { width: auto; margin-right: 1; }
     .tool-status { width: 1fr; color: $text-muted; text-wrap: nowrap; text-overflow: ellipsis; }
@@ -237,35 +274,39 @@ class RepluxApp(App[None]):
 
     async def _show_reply(self, user_input: str) -> None:
         transcript = self.query_one("#transcript-content", Vertical)
-        first_reply = Static("", classes="reply", markup=False)
-        reply: Static | None = first_reply
+        user = TranscriptMessage(user_input, role="user")
+        reply: TranscriptMessage | None = None
         text = ""
         thinking_text = ""
         thinking: Static | None = None
+        thinking_control: Collapsible | None = None
         tools: dict[str, ToolCallView] = {}
 
         async def show(event: StreamEvent) -> None:
-            nonlocal reply, text, thinking, thinking_text
+            nonlocal reply, text, thinking, thinking_text, thinking_control
             self._follow_transcript()
             if isinstance(event, TextDelta):
-                if reply is None:
-                    reply = Static("", classes="reply", markup=False)
-                    text = ""
-                    await transcript.mount(reply)
                 text += event.text
-                reply.update(text)
+                if reply is None:
+                    if not text.strip():
+                        return
+                    reply = TranscriptMessage(text, role="reply")
+                    await transcript.mount(reply)
+                else:
+                    reply.body.update(text)
             elif isinstance(event, ThinkingDelta) and event.text:
                 thinking_text += event.text
                 if thinking is None:
                     if not thinking_text.strip():
                         return
                     thinking = Static(thinking_text, classes="thinking-content", markup=False)
+                    thinking_control = ThinkingView(
+                        thinking, title="Thinking", collapsed=True,
+                        collapsed_symbol="+", expanded_symbol="-", classes="thinking",
+                    )
                     await transcript.mount(
-                        Collapsible(
-                            thinking, title="Thinking", collapsed=True,
-                            collapsed_symbol="+", expanded_symbol="-", classes="thinking",
-                        ),
-                        before=first_reply,
+                        thinking_control,
+                        after=user,
                     )
                 else:
                     thinking.update(thinking_text)
@@ -275,6 +316,7 @@ class RepluxApp(App[None]):
                 await transcript.mount(view)
                 self.query_one("#status", Static).update(f"Running {event.name}...")
                 reply = None
+                text = ""
             elif isinstance(event, ToolFinished):
                 finished = tools.get(event.call_id)
                 if finished is None:
@@ -285,13 +327,14 @@ class RepluxApp(App[None]):
                 if not self._cancelling:
                     self.query_one("#status", Static).update("Generating...")
                 reply = None
+                text = ""
             elif isinstance(event, ReplyCompleted):
                 self.query_one("#status", Static).update("Ready")
 
         events: AsyncGenerator[StreamEvent, None] | None = None
         try:
             self._follow_transcript()
-            await transcript.mount(Static(user_input, classes="user", markup=False), first_reply)
+            await transcript.mount(user)
             if self._cancelling:
                 raise asyncio.CancelledError
             events = self._client.stream_reply(user_input)
@@ -324,8 +367,12 @@ class RepluxApp(App[None]):
             self._follow_transcript()
             await transcript.mount(Static(message, classes="turn-status", markup=False))
         finally:
-            if events is not None:
-                await events.aclose()
+            try:
+                if events is not None:
+                    await events.aclose()
+            finally:
+                if thinking_control is not None:
+                    thinking_control.title = "Thoughts"
 
     async def on_unmount(self) -> None:
         try:
