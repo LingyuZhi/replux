@@ -180,6 +180,10 @@ def _tool_title(name: str, arguments: str, result: ToolResult | None = None) -> 
 def _tool_summary(name: str, result: ToolResult) -> str:
     fallback = f"Failed ({result.error_code})" if result.status == "error" else _TOOL_STATUS_LABELS[result.status]
     summary = next((line.strip() for line in result.output.splitlines() if line.strip()), fallback)
+    if result.status == "error" and result.error_code is not None and result.output.strip():
+        reason = result.error_code.replace("_", " ").capitalize()
+        if not summary.casefold().startswith(reason.casefold()):
+            summary = f"{reason} · {summary}"
     details = result.details
     if result.status == "success":
         if name == "read_file":

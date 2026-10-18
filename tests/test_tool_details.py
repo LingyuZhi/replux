@@ -176,16 +176,16 @@ async def test_find_and_search_summaries_distinguish_total_and_returned_counts(
     (ToolResult("success", "Command finished.\nkept tail", details={"exit_code": 0, "truncated_by": "lines"}),
      "Success", "Truncated · Exited with code 0"),
     (ToolResult("error", "Cannot run the command: missing Bash.", "command_failed"),
-     "Failed", "Cannot run the command: missing Bash."),
+     "Failed", "Command failed · Cannot run the command: missing Bash."),
     (ToolResult("error", "Command failed with exit code 7.", "command_failed", {"exit_code": 7}),
      "Failed", "Command failed with exit code 7."),
     (ToolResult("error", "Command timed out after 5 seconds.", "timeout", {"exit_code": -15, "side_effects": "kept"}),
-     "Failed", "Command timed out after 5 seconds."),
+     "Failed", "Timeout · Command timed out after 5 seconds."),
     (ToolResult("cancelled", "Command was cancelled and its process group was stopped.", details={"exit_code": -15, "side_effects": "kept"}),
      "Cancelled", "Command was cancelled and its process group was stopped."),
     (ToolResult("skipped", "Not run because an earlier call failed."), "Skipped", "Not run because an earlier call failed."),
     (ToolResult("error", "Command stopped because captured output reached the log limit.", "output_limit_exceeded", {"exit_code": -15}),
-     "Failed", "Truncated · Command stopped because captured output reached the log limit."),
+     "Failed", "Truncated · Output limit exceeded · Command stopped because captured output reached the log limit."),
     (ToolResult("error", "", "timeout"), "Failed", "Failed (timeout)"),
 ])
 async def test_command_summaries_keep_real_terminal_states_and_keyboard_details(
@@ -478,7 +478,8 @@ async def test_file_failures_keep_actual_file_state_and_side_effects(name: str, 
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
-        assert app.query_one(".tool-preview", Static).content == f"└ {result.output}"
+        prefix = "Timeout · " if status == "error" else ""
+        assert app.query_one(".tool-preview", Static).content == f"└ {prefix}{result.output}"
         assert app.query_one(".tool-status", Static).content == ("Failed" if status == "error" else "Cancelled")
         await pilot.click(app.query_one(".tool-heading"))
         assert json.loads(str(app.query_one(".tool-result-details", Static).content)) == {"file_state": "written"}
@@ -500,3 +501,28 @@ async def test_titles_include_reported_scope_when_arguments_use_the_default(
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         assert app.query_one(".tool-header", Static).content == expected
+
+
+@pytest.mark.parametrize("size", [(80, 24), (120, 40), (160, 50)])
+@pytest.mark.parametrize(("error_code", "reason"), [("timeout", "Timeout"), ("not_a_file", "Not a file")])
+async def test_failure_reason_stays_visible_before_a_long_path(
+    size: tuple[int, int], error_code: str, reason: str,
+) -> None:
+    target = "/work/" + "long-directory/" * 30 + "notes.txt"
+    output = (
+        f"Reading {target} did not finish within 10 seconds."
+        if error_code == "timeout" else f"{target} is not a regular file."
+    )
+    result = ToolResult("error", output, error_code, {"path": target})
+    app = RepluxApp(ResultClient("read_file", json.dumps({"path": target}), result), model="scripted-model")
+    async with app.run_test(size=size) as pilot:
+        app.query_one("#prompt", TextArea).text = "read long path"
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
+        assert str(app.query_one(".tool-preview", Static).content).startswith(f"└ {reason} · ")
+        screenshot = app.export_screenshot()
+        assert reason.replace(" ", "&#160;") in screenshot
+        await pilot.click(app.query_one(".tool-heading"))
+        assert app.query_one(".tool-output", Static).content == output
+        assert f"Error code: {error_code}" in str(app.query_one(".tool-metadata", Static).content)
