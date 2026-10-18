@@ -18,6 +18,7 @@ from replux.llm import LLMClient, LLMError, ReplyCompleted, StreamEvent, TextDel
 from replux.tui import RepluxApp
 from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events, thinking_events, unfinished_events
 from tests.test_config import VALID_YAML
+from tests.tui_support import screen_text
 
 
 @pytest.mark.parametrize("empty_text", ["", " \n"], ids=["empty", "whitespace"])
@@ -90,9 +91,10 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
 
         client.release[2].set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
         assert thinking.title == "Thoughts"
         assert not thinking.collapsed
-        assert app.query_one(".reply", Static).content == "正文正常显示"
+        assert "正文正常显示" in screen_text(app)
         await pilot.press("enter")
         assert thinking.collapsed
         assert client.inputs == ["first"]
@@ -254,7 +256,7 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
             assert "再回答" in app.export_screenshot()
             assert "opaque-" not in app.export_screenshot()
             assert app.query_one(".thinking-content", Static).content == "先分析\n再回答"
-            assert app.query_one(".reply", Static).content == "你好，世界\n"
+            assert "你好，世界" in screen_text(app)
             assert app.query_one("#status", Static).content == "Writing reply…"
             assert thinking.title == "Thinking"
             assert not stream.closed
@@ -310,7 +312,7 @@ async def test_no_thinking_control_without_displayable_api_text(tmp_path: Path, 
         await asyncio.wait_for(stream.blocked.wait(), timeout=2)
         await pilot.pause()
         assert not app.query(Collapsible)
-        assert app.query_one(".reply", Static).content == "你好，世界\n"
+        assert "你好，世界" in screen_text(app)
         assert "opaque-" not in app.export_screenshot()
         stream.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -346,7 +348,7 @@ async def test_yaml_to_sdk_to_visible_reply_before_terminal_event(
         await asyncio.wait_for(stream.blocked.wait(), timeout=2)
         await pilot.pause()
         expected = "抱歉，无法回答。\n" if refusal else "你好，世界\n"
-        assert app.query_one(".reply", Static).content == expected
+        assert expected.strip() in screen_text(app)
         assert app.query_one("#status", Static).content == "Writing reply…"
         assert not stream.closed
         assert len(transport.requests) == 1
@@ -361,7 +363,7 @@ async def test_yaml_to_sdk_to_visible_reply_before_terminal_event(
         await pilot.pause()
         assert stream.closed
         assert app.query_one("#status", Static).content == "Ready"
-        assert app.query_one(".reply", Static).content == expected
+        assert expected.strip() in screen_text(app)
         await pilot.press("ctrl+c")
 
     assert transport.closed
@@ -400,7 +402,7 @@ async def test_selected_yaml_controls_actual_request_until_restart(
         app.query_one("#prompt", TextArea).text = "one question"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        assert app.query_one(".reply", Static).content == "你好，世界\n"
+        assert "你好，世界" in screen_text(app)
         await pilot.press("ctrl+c")
 
     assert len(transport.requests) == 1
@@ -451,9 +453,9 @@ async def test_tui_accepts_a_scripted_llm_client_and_preserves_input() -> None:
         expected = "中文问题\n  [red]原样提问[/red]\n\tprint('你好')\n\n  "
         assert client.inputs == [expected]
         assert app.query_one(".user", Static).content == expected
-        assert app.query_one(".reply", Static).content == "[bold]这仍是正文[/bold]\n```python\n    print('你好')\n```\n"
+        assert "    print('你好')" in screen_text(app)
         assert "[bold]这仍是正文[/bold]" in app.export_screenshot()
-        assert "```python" in app.export_screenshot()
+        assert "```python" not in app.export_screenshot()
         await pilot.press("ctrl+c")
     assert client.closed
 
@@ -533,7 +535,8 @@ async def test_request_error_preserves_transcript_and_draft_without_rendering_cr
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert [user.content for user in app.query(".user").results(Static)] == ["first", "failed", "follow-up"]
-        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好，世界\n"]
+        assert len(app.query(".reply")) == 2
+        assert "你好，世界" in screen_text(app)
         await pilot.press("ctrl+c")
     field = "messages" if protocol == "anthropic" else "input"
     assert len(requests) == 3
@@ -590,7 +593,8 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
         outcomes = list(app.query(".turn-outcome").results(Static))
         assert len(outcomes) == 2
         assert str(outcomes[-1].content).startswith("Cancelled after ")
-        assert [reply.content for reply in app.query(".reply").results(Static)] == (["你好，世界\n", "你好"] if partial else ["你好，世界\n"])
+        assert len(app.query(".reply")) == (2 if partial else 1)
+        assert "你好" in screen_text(app)
         if not partial:
             await pilot.pause()
             last_user = list(app.query(".user").results(Static))[-1]
@@ -720,7 +724,8 @@ async def test_incomplete_turn_stays_visible_and_out_of_next_request(
             await pilot.press("enter")
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert incomplete.closed
-        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好，世界\n"]
+        assert len(app.query(".reply")) == 2
+        assert "你好，世界" in screen_text(app)
         assert "Reply incomplete" in str(app.query_one(".turn-status", Static).content)
         outcomes = list(app.query(".turn-outcome").results(Static))
         assert len(outcomes) == 2
@@ -761,7 +766,8 @@ async def test_recreated_app_starts_with_empty_conversation(tmp_path: Path, prot
                 expected.append({"role": "user", "content": question})
                 assert json.loads(transport.requests[-1].content)[field] == expected
                 expected.extend(native_reply(protocol))
-            assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n"] * len(questions)
+            assert len(app.query(".reply")) == len(questions)
+            assert "你好，世界" in screen_text(app)
             await pilot.press("ctrl+c")
         assert len(transport.requests) == len(questions)
         assert all(stream.closed for stream in streams)

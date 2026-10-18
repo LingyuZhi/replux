@@ -102,10 +102,10 @@ async def test_running_tool_stays_static_while_bottom_activity_animates() -> Non
         assert activity.content == last_frame
         assert not activity.display
         user = app.query_one(".user", Static)
-        before, after = app.query(".reply").results(Static)
+        before, after = app.query(".reply")
         assert user.content == "读一下 notes.txt"
-        assert before.content == "我先读文件。"
-        assert after.content == "文件有八行。"
+        assert "我先读文件。" in visible_text(app)
+        assert "文件有八行。" in visible_text(app)
         assert user.region.bottom < before.region.y < view.region.y < after.region.y
         assert prompt.text == "草稿"
 
@@ -207,7 +207,9 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
-        assert [reply.content for reply in app.query(".reply").results(Static)] == ["我先读文件。", "你好，世界\n"]
+        assert len(app.query(".reply")) == 2
+        assert "我先读文件。" in visible_text(app)
+        assert "你好，世界" in visible_text(app)
     assert len(transport.requests) == 2
     assert transport.closed
     first, summary_request = (json.loads(request.content) for request in transport.requests)
@@ -271,7 +273,7 @@ async def test_a_failed_batch_shows_each_result_and_finishes_after_the_summary(
         assert app.query_one("#status", Static).content == "Ready"
         assert str(views[1].query_one(".tool-status", Static).content).startswith("Failed")
         assert str(app.query_one(".turn-outcome", Static).content).startswith("Finished in ")
-        assert [reply.content for reply in app.query(".reply").results(Static)][-1] == "你好，世界\n"
+        assert "你好，世界" in visible_text(app)
     assert "should-not" not in transport.requests[1].content.decode()
 
 

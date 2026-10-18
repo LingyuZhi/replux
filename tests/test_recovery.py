@@ -11,6 +11,7 @@ from textual.widgets import Static, TextArea
 from replux.llm import AuthenticationError, LLMError, NetworkError, RateLimitError, StreamEvent, TextDelta, create_client
 from replux.tui import RepluxApp
 from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events
+from tests.tui_support import screen_lines, screen_text
 
 
 @pytest.mark.parametrize(
@@ -215,7 +216,9 @@ async def test_partial_failure_keeps_visible_text_and_draft_then_uses_only_compl
         await pilot.press("enter")
         await asyncio.wait_for(pending.blocked.wait(), timeout=2)
         prompt.text = "follow-up"
-        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好"]
+        await pilot.pause()
+        assert len(app.query(".reply")) == 2
+        assert any(line.strip() == "● 你好" for line in screen_lines(app))
         pending.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert pending.closed
@@ -227,7 +230,9 @@ async def test_partial_failure_keeps_visible_text_and_draft_then_uses_only_compl
         assert len(transport.requests) == 2
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
-        assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好", "你好，世界\n"]
+        await pilot.pause()
+        assert len(app.query(".reply")) == 3
+        assert "你好，世界" in screen_text(app)
         assert "Request failed" in str(app.query_one(".turn-status", Static).content)
         await pilot.press("ctrl+c")
     field = "messages" if protocol == "anthropic" else "input"

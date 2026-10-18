@@ -7,7 +7,6 @@ from importlib.metadata import version
 import json
 from pathlib import Path
 from time import monotonic
-from typing import Literal
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -24,6 +23,8 @@ from replux.llm import (
     ToolBatchLimitError, ToolFinished, ToolStarted,
 )
 from replux.tools import ToolResult
+from replux.reply import ReplyMessage
+from replux.transcript import TranscriptScroll
 
 
 SPARK_LOGO = "\n".join((
@@ -37,16 +38,15 @@ SPARK_LOGO = "\n".join((
 _TOOL_STATUS_LABELS = {"success": "Success", "error": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"}
 
 
-class TranscriptMessage(Horizontal):
-    """Keep one marker beside a plain-text body, including wrapped lines."""
+class UserMessage(Horizontal):
+    """Keep one user marker beside a literal body, including wrapped lines."""
 
-    def __init__(self, text: str, *, role: Literal["user", "reply"]) -> None:
-        super().__init__(classes=f"message {role}-message")
-        self.body = Static(text, classes=role, markup=False)
-        self._marker = "›" if role == "user" else "●"
+    def __init__(self, text: str) -> None:
+        super().__init__(classes="message user-message")
+        self.body = Static(text, classes="user", markup=False)
 
     def compose(self) -> ComposeResult:
-        yield Static(self._marker, classes="message-marker", markup=False)
+        yield Static("›", classes="message-marker", markup=False)
         yield self.body
 
 
@@ -354,7 +354,7 @@ class RepluxApp(App[None]):
         directory = Path.cwd()
         home = Path.home()
         display_directory = str(Path("~") / directory.relative_to(home)) if directory.is_relative_to(home) else str(directory)
-        with VerticalScroll(id="transcript"):
+        with TranscriptScroll(id="transcript"):
             with Vertical(id="transcript-content"):
                 with Horizontal(id="startup"):
                     yield Static(SPARK_LOGO, id="startup-logo", markup=False)
@@ -422,8 +422,8 @@ class RepluxApp(App[None]):
 
     async def _show_reply(self, user_input: str) -> None:
         transcript = self.query_one("#transcript-content", Vertical)
-        user = TranscriptMessage(user_input, role="user")
-        reply: TranscriptMessage | None = None
+        user = UserMessage(user_input)
+        reply: ReplyMessage | None = None
         text = ""
         thinking_text = ""
         thinking: Static | None = None
@@ -431,6 +431,22 @@ class RepluxApp(App[None]):
         tools: dict[str, ToolCallView] = {}
 
         async def show(event: StreamEvent) -> None:
+            if isinstance(event, TextDelta):
+                # Finish displaying the returned delta before forwarding cancellation.
+                rendering = asyncio.create_task(render_event(event))
+                try:
+                    await asyncio.shield(rendering)
+                except asyncio.CancelledError:
+                    await rendering
+                    raise
+            else:
+                await render_event(event)
+
+        async def render_event(event: StreamEvent) -> None:
+            async with self.query_one(TranscriptScroll).preserve_reading_position():
+                await show_event(event)
+
+        async def show_event(event: StreamEvent) -> None:
             nonlocal reply, text, thinking, thinking_text, thinking_control
             self._follow_transcript()
             if isinstance(event, TextDelta):
@@ -440,10 +456,9 @@ class RepluxApp(App[None]):
                 if reply is None:
                     if not text.strip():
                         return
-                    reply = TranscriptMessage(text, role="reply")
+                    reply = ReplyMessage()
                     await transcript.mount(reply)
-                else:
-                    reply.body.update(text)
+                await reply.update(text)
             elif isinstance(event, ThinkingDelta) and event.text:
                 thinking_text += event.text
                 if event.text.strip():

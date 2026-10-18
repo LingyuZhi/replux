@@ -313,7 +313,7 @@ async def test_failure_records_total_time_only_after_cleanup_and_allows_a_follow
                 "cleanup-error": "Request failed: Stream close failed.",
             }[ending]
             assert app.query_one(".turn-status", Static).content == message
-            assert app.query_one(".reply", Static).content == "Partial reply."
+            assert "Partial reply." in screen_text(app)
             assert app.query_one(".turn-outcome", Static).styles.color == app.query_one("#activity").styles.color
             assert app.query_one("#status", Static).content == "Ready"
             assert not app.query_one("#activity-dot").display

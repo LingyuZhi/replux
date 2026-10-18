@@ -10,6 +10,7 @@ from textual.worker import WorkerCancelled
 from replux.llm import LLMClient, LLMError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta, ToolFinished, ToolStarted
 from replux.tools import ToolResult
 from replux.tui import RepluxApp
+from tests.tui_support import screen_text
 
 
 async def test_tool_first_turn_has_no_empty_reply_or_spacing_before_the_tool() -> None:
@@ -41,7 +42,7 @@ async def test_tool_first_turn_has_no_empty_reply_or_spacing_before_the_tool() -
         await pilot.pause()
         user = app.query_one(".user", Static)
         heading = app.query_one(".tool-header", Static)
-        assert not [reply for reply in app.query(".reply").results(Static) if reply.display]
+        assert not [reply for reply in app.query(".reply") if reply.display]
         assert heading.region.y == user.region.bottom + 1
         assert heading.region.x == user.region.x
         assert app.focused is prompt
@@ -49,8 +50,8 @@ async def test_tool_first_turn_has_no_empty_reply_or_spacing_before_the_tool() -
         client.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
-        reply = app.query_one(".reply", Static)
-        assert reply.content == "[bold]Plain reply[/bold]\n  continued"
+        reply = app.query_one(".reply")
+        assert "[bold]Plain reply[/bold] continued" in screen_text(app)
         assert reply.region.x == user.region.x
         assert reply.region.y == app.query_one(".tool-preview").region.bottom + 1
         assert "[bold]Plain reply[/bold]" in unescape(app.export_screenshot()).replace("\xa0", " ")
@@ -85,7 +86,7 @@ async def test_late_thinking_follows_its_input_even_when_reply_and_tools_are_alr
             await pilot.pause()
             assert not app.query(".thinking")
             user = app.query_one(".user", Static)
-            reply = app.query_one(".reply", Static)
+            reply = app.query_one(".reply")
             heading = app.query_one(".tool-header", Static)
             assert user.region.bottom < reply.region.y < heading.region.y
             prompt.text = "unsent draft"
@@ -112,7 +113,7 @@ async def test_expanding_thinking_while_reading_keeps_position_focus_and_bottom_
 
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
             yield ThinkingDelta("".join(f"Thought {line}\n" for line in range(60)))
-            yield TextDelta("Old reply\n" * 60)
+            yield TextDelta("Old reply  \n" * 60)
             self.reached[0].set()
             await self.release[0].wait()
             yield ThinkingDelta("Additional thought\n")
@@ -267,7 +268,7 @@ async def test_thinking_is_one_line_and_becomes_thoughts_only_after_turn_cleanup
 @pytest.mark.parametrize("size", [(80, 24), (120, 40), (160, 50)])
 async def test_multiline_input_background_markers_and_body_columns_at_agreed_sizes(size: tuple[int, int]) -> None:
     user_input = "首行 [bold]literal[/bold]\n  second line\n" + "wrap " * 40
-    reply_text = "[bold]Plain reply[/bold]\n" + "reply " * 30
+    reply_text = "[bold]Plain reply[/bold]  \n" + "reply " * 30
 
     class ScriptedClient(LLMClient):
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
@@ -288,12 +289,12 @@ async def test_multiline_input_background_markers_and_body_columns_at_agreed_siz
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         user = app.query_one(".user", Static)
-        reply = app.query_one(".reply", Static)
+        reply = app.query_one(".reply")
         heading = app.query_one(".tool-header", Static)
         thinking = app.query_one(".thinking", Collapsible)
         assert user.content == user_input
         assert user.region.height >= 4
-        assert reply.content == reply_text
+        assert "[bold]Plain reply[/bold]" in screen_text(app)
         assert reply.region.height >= 3
         assert user.region.x == reply.region.x == heading.region.x == thinking.region.x
         assert thinking.region.height == 1
