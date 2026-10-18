@@ -73,7 +73,7 @@ async def test_thinking_toggle_preserves_streaming_content_and_stays_local_to_ea
         await asyncio.wait_for(client.reached[2].wait(), timeout=2)
         await pilot.pause()
         assert "再回答" in app.export_screenshot()
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Thinking…"
         assert not thinking.collapsed
 
         await pilot.click(title, offset=(1, 0))
@@ -176,7 +176,7 @@ async def test_streaming_follows_bottom_and_preserves_old_transcript_while_editi
         await pilot.pause()
         assert transcript.scroll_y == reading_position
         assert not transcript.is_vertical_scroll_end
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == ("Writing reply…" if channel == "reply" else "Thinking…")
         assert prompt.region.bottom == 24
         assert transcript.region.bottom <= app.query_one("#composer").region.y
 
@@ -201,7 +201,7 @@ async def test_streaming_follows_bottom_and_preserves_old_transcript_while_editi
             await pilot.press("ctrl+c")
             with pytest.raises(WorkerCancelled):
                 await asyncio.wait_for(worker.wait(), timeout=2)
-            assert app.query_one(".turn-status", Static).content == "Cancelled"
+            assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
         else:
             client.release[4].set()
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -255,7 +255,7 @@ async def test_yaml_to_streaming_thinking_keeps_toggles_local_and_native_blocks_
             assert "opaque-" not in app.export_screenshot()
             assert app.query_one(".thinking-content", Static).content == "先分析\n再回答"
             assert app.query_one(".reply", Static).content == "你好，世界\n"
-            assert app.query_one("#status", Static).content == "Generating..."
+            assert app.query_one("#status", Static).content == "Writing reply…"
             assert thinking.title == "Thinking"
             assert not stream.closed
             await pilot.click(title, offset=(1, 0))
@@ -347,7 +347,7 @@ async def test_yaml_to_sdk_to_visible_reply_before_terminal_event(
         await pilot.pause()
         expected = "抱歉，无法回答。\n" if refusal else "你好，世界\n"
         assert app.query_one(".reply", Static).content == expected
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Writing reply…"
         assert not stream.closed
         assert len(transport.requests) == 1
 
@@ -520,6 +520,10 @@ async def test_request_error_preserves_transcript_and_draft_without_rendering_cr
         await pilot.pause()
         assert app.is_running
         assert "Request failed" in str(app.query_one(".turn-status", Static).content)
+        outcomes = list(app.query(".turn-outcome").results(Static))
+        assert len(outcomes) == 2
+        assert str(outcomes[0].content).startswith("Finished in ")
+        assert str(outcomes[1].content).startswith("Failed after ")
         assert app.query_one("#status", Static).content == "Ready"
         assert prompt.text == "follow-up"
         assert len(requests) == 2
@@ -569,7 +573,8 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
             await asyncio.wait_for(pending.closing.wait(), timeout=2)
             assert app.is_running
             assert not pending.closed
-            assert app.query_one("#status", Static).content == "Cancelling..."
+            assert app.query_one("#status", Static).content == "Cancelling…"
+            assert len(app.query(".turn-outcome")) == 1
             assert prompt.text == "follow-up"
             assert app.clipboard == "unchanged"
             await pilot.press("enter", "ctrl+c")
@@ -582,12 +587,14 @@ async def test_ctrl_c_waits_for_stream_cleanup_then_allows_follow_up(protocol: s
         assert pending.closed
         assert app.is_running
         assert app.query_one("#status", Static).content == "Ready"
-        assert "Cancelled" in str(app.query_one(".turn-status", Static).content)
+        outcomes = list(app.query(".turn-outcome").results(Static))
+        assert len(outcomes) == 2
+        assert str(outcomes[-1].content).startswith("Cancelled after ")
         assert [reply.content for reply in app.query(".reply").results(Static)] == (["你好，世界\n", "你好"] if partial else ["你好，世界\n"])
         if not partial:
             await pilot.pause()
             last_user = list(app.query(".user").results(Static))[-1]
-            assert app.query_one(".turn-status").region.y == last_user.region.bottom + 1
+            assert outcomes[-1].region.y == last_user.region.bottom + 1
         assert prompt.text == "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -715,11 +722,15 @@ async def test_incomplete_turn_stays_visible_and_out_of_next_request(
         assert incomplete.closed
         assert [reply.content for reply in app.query(".reply").results(Static)] == ["你好，世界\n", "你好，世界\n"]
         assert "Reply incomplete" in str(app.query_one(".turn-status", Static).content)
+        outcomes = list(app.query(".turn-outcome").results(Static))
+        assert len(outcomes) == 2
+        assert str(outcomes[-1].content).startswith("Failed after ")
         assert app.query_one("#status", Static).content == "Ready"
         prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         assert len(app.query(".reply")) == 3
+        assert len(app.query(".turn-outcome")) == 3
         assert "Reply incomplete" in str(app.query_one(".turn-status", Static).content)
         assert [user.content for user in app.query(".user").results(Static)] == ["first", "unfinished", "follow-up"]
     field = "messages" if protocol == "anthropic" else "input"

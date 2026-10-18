@@ -729,7 +729,7 @@ async def test_the_ui_shows_a_real_edit_and_stays_busy_until_the_summary(
         assert "pkg/notes.txt" in str(view.query_one(".tool-header", Static).content)
         assert str(view.query_one(".tool-status", Static).content).startswith("Success")
         assert "Applied" in str(view.query_one(".tool-preview", Static).content)
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Working…"
         summary.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
@@ -762,7 +762,7 @@ async def test_the_ui_shows_a_failed_edit_batch_without_changing_the_skipped_fil
         failed = list(app.query(".tool-call"))[1]
         await pilot.click(failed.query_one(".tool-heading"))
         assert "Error code: file_not_found" in str(failed.query_one(".tool-metadata", Static).content)
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Working…"
         summary.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
@@ -796,12 +796,13 @@ async def test_the_ui_stays_cancelling_until_an_in_progress_edit_finishes(
         await pilot.press("enter")
         assert await asyncio.to_thread(hold.entered.wait, 2)
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Running edit_file..."
+        assert app.query_one("#status", Static).content == "Edit a.txt…"
         assert target.read_bytes() == b"old"
         worker = next(iter(app.workers))
         await pilot.press("ctrl+c")
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Cancelling..."
+        assert app.query_one("#status", Static).content == "Cancelling…"
+        assert not app.query(".turn-outcome")
         assert target.read_bytes() == b"old"
         assert len(list(tmp_path.glob(".replux-*"))) == 1
         prompt.text = "草稿"
@@ -817,6 +818,7 @@ async def test_the_ui_stays_cancelling_until_an_in_progress_edit_finishes(
         assert list(tmp_path.glob(".replux-*")) == []
         assert app.query_one("#status", Static).content == "Ready"
         assert statuses(app) == ["Success", "Skipped"]
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
         prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)

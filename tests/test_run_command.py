@@ -852,7 +852,7 @@ async def test_the_ui_summarizes_the_command_and_expand_does_not_read_the_log(
             assert preview == "└ Truncated · Exited with code 0"
             log_path = Path(str(view.query_one(".tool-log", Static).content))
             assert log_path.read_text(encoding="utf-8").startswith("L1\n")
-            assert app.query_one("#status", Static).content == "Generating..."
+            assert app.query_one("#status", Static).content == "Working…"
             log_path.write_text("SECRET LOG", encoding="utf-8")
             output = view.query_one(".tool-details")
             assert not output.display
@@ -891,12 +891,13 @@ async def test_the_ui_stays_cancelling_until_the_process_group_is_reaped(
             await pilot.press("enter")
             await wait_for_tick(marker)
             await pilot.pause()
-            assert app.query_one("#status", Static).content == "Running run_command..."
+            assert app.query_one("#status", Static).content == f"Run {command}…"
             assert process_state(int(child.read_text())) == "running"
             worker = next(iter(app.workers))
             await pilot.press("ctrl+c")
             await pilot.pause()
-            assert app.query_one("#status", Static).content == "Cancelling..."
+            assert app.query_one("#status", Static).content == "Cancelling…"
+            assert not app.query(".turn-outcome")
             assert app.query_one(".tool-dot", Static).has_class("running")
             assert process_state(int(child.read_text())) == "running"
             prompt.text = "草稿"
@@ -909,6 +910,7 @@ async def test_the_ui_stays_cancelling_until_the_process_group_is_reaped(
             assert process_state(int(leader.read_text())) == "dead"
             assert process_state(int(child.read_text())) == "dead"
             assert not later.exists()
+            assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
             assert app.query_one("#status", Static).content == "Ready"
             shown = [status.split(" · ", 1)[0] for status in statuses(app)]
             preview = str(app.query_one(".tool-preview", Static).content)

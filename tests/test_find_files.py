@@ -570,7 +570,7 @@ async def test_the_ui_summarizes_counts_and_expand_matches_the_model_result(
         assert view.query_one(".tool-status", Static).content == "Success"
         preview = str(view.query_one(".tool-preview", Static).content)
         assert preview == "└ Found 7 files · Returned 7"
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Working…"
         assert "Confirm" not in str(app.query_one("#status", Static).content)
         output = view.query_one(".tool-details")
         await pilot.click(view.query_one(".tool-heading"))
@@ -611,12 +611,13 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         await pilot.press("enter")
         await wait_for_tick(marker)
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Running find_files..."
+        assert app.query_one("#status", Static).content == "Find *.txt…"
         assert process_state(int(child.read_text())) == "running"
         worker = next(iter(app.workers))
         await pilot.press("ctrl+c")
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Cancelling..."
+        assert app.query_one("#status", Static).content == "Cancelling…"
+        assert not app.query(".turn-outcome")
         assert app.query_one(".tool-dot", Static).has_class("running")
         assert process_state(int(child.read_text())) == "running"
         prompt.text = "草稿"
@@ -629,6 +630,7 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         assert process_state(int(leader.read_text())) == "dead"
         assert process_state(int(child.read_text())) == "dead"
         assert not later.exists()
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
         assert app.query_one("#status", Static).content == "Ready"
         shown = [status.split(" · ", 1)[0] for status in statuses(app)]
         assert shown == ["Cancelled", "Skipped"]

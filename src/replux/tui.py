@@ -2,9 +2,11 @@
 
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
+from contextlib import aclosing
 from importlib.metadata import version
 import json
 from pathlib import Path
+from time import monotonic
 from typing import Literal
 
 from textual import work
@@ -18,7 +20,7 @@ from textual.worker import WorkerCancelled
 from textual.widgets import Collapsible, Static, TextArea
 
 from replux.llm import (
-    IncompleteReplyError, LLMClient, LLMError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta,
+    IncompleteReplyError, LLMClient, LLMError, StreamEvent, TextDelta, ThinkingDelta,
     ToolBatchLimitError, ToolFinished, ToolStarted,
 )
 from replux.tools import ToolResult
@@ -81,8 +83,6 @@ class ToolCallView(Vertical):
         super().__init__(name=name, classes="tool-call")
         self._tool_name = name
         self._arguments = arguments
-        self._timer: Timer | None = None
-        self._bright = True
         self._finished = False
         self._expanded = False
 
@@ -102,14 +102,6 @@ class ToolCallView(Vertical):
             yield Static("", classes="tool-result-details", markup=False)
             yield Static("", classes="tool-log", markup=False)
 
-    def on_mount(self) -> None:
-        if not self._finished:
-            self._timer = self.set_interval(0.5, self._breathe)
-
-    def _breathe(self) -> None:
-        self._bright = not self._bright
-        self.query_one(".tool-dot", Static).styles.text_opacity = 1.0 if self._bright else 0.3
-
     def on_tool_heading_toggle(self, event: ToolHeading.Toggle) -> None:
         event.stop()
         self._expanded = not self._expanded
@@ -121,14 +113,10 @@ class ToolCallView(Vertical):
         if self._finished:
             return
         self._finished = True
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer = None
         dot = self.query_one(".tool-dot", Static)
         dot.remove_class("running")
         if result.status == "error":
             dot.add_class("error")
-        dot.styles.text_opacity = 1.0
         status = _TOOL_STATUS_LABELS[result.status]
         self.query_one(".tool-header", Static).update(_tool_title(self._tool_name, self._arguments, result))
         self.query_one(".tool-status", Static).update(status)
@@ -244,13 +232,68 @@ class Prompt(TextArea):
                 self.replace("\n", *self.selection, maintain_selection_offset=False)
 
 
+class TurnActivity(Horizontal):
+    """Show one local clock and animation for the whole Turn, including cleanup."""
+
+    def __init__(self) -> None:
+        super().__init__(id="activity")
+        self._started_at: float | None = None
+        self._timer: Timer | None = None
+        self._frame = 0
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="activity-dot", markup=False)
+        yield Static("Ready", id="status", markup=False)
+        yield Static("", id="activity-time", markup=False)
+        yield Static("Ctrl+C to cancel", id="activity-hint", markup=False)
+
+    def on_mount(self) -> None:
+        self.stop()
+
+    @property
+    def elapsed(self) -> float:
+        assert self._started_at is not None
+        return monotonic() - self._started_at
+
+    def start(self) -> None:
+        self._started_at = monotonic()
+        self._frame = 0
+        for selector in ("#activity-dot", "#activity-time", "#activity-hint"):
+            self.query_one(selector).display = True
+        self.show_action("Working…")
+        self._tick()
+        self._timer = self.set_interval(0.1, self._tick)
+
+    def show_action(self, action: str) -> None:
+        self.query_one("#status", Static).update(action)
+
+    def _tick(self) -> None:
+        self.query_one("#activity-dot", Static).update("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[self._frame % 10])
+        self._frame += 1
+        self.query_one("#activity-time", Static).update(f"{self.elapsed:.1f}s")
+
+    def stop(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+        self._started_at = None
+        self.show_action("Ready")
+        for selector in ("#activity-dot", "#activity-time", "#activity-hint"):
+            self.query_one(selector).display = False
+
+
 class RepluxApp(App[None]):
     TITLE = "Replux"
     BINDINGS = [Binding("ctrl+c", "cancel_or_quit", "Cancel / Quit", priority=True)]
     CSS = """
     #composer { dock: bottom; height: auto; }
-    #prompt { height: auto; min-height: 3; max-height: 8; }
-    #status { height: 1; padding: 0 1; color: $text-muted; }
+    #prompt-entry { height: auto; border-top: solid $foreground 20%; padding: 0 2; }
+    #prompt-marker { width: 2; height: 1; }
+    #prompt { width: 1fr; height: auto; min-height: 1; max-height: 8; border: none; padding: 0; }
+    #activity { height: 1; padding: 0 2; color: $text-muted; }
+    #activity-dot { width: 2; color: #c6b8eb; }
+    #status { width: 1fr; height: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    #activity-time, #activity-hint { width: auto; margin-left: 2; height: 1; }
     #transcript { height: 1fr; padding: 1 2; }
     #transcript-content { height: auto; min-height: 100%; }
     #startup { height: 5; }
@@ -276,6 +319,7 @@ class RepluxApp(App[None]):
     .thinking > Contents { padding: 0; }
     .thinking-content { color: $text-muted; }
     .turn-status { margin-top: 1; color: $warning; }
+    .turn-outcome { margin: 1 0 0 2; color: $text-muted; }
     .tool-call { height: auto; margin-top: 1; }
     .tool-heading { height: 1; pointer: pointer; }
     .tool-heading:hover { background: $boost; }
@@ -303,8 +347,10 @@ class RepluxApp(App[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="composer"):
-            yield Static("Ready", id="status")
-            yield Prompt(placeholder="Enter to send, Ctrl+J for a new line", id="prompt")
+            yield TurnActivity()
+            with Horizontal(id="prompt-entry"):
+                yield Static("›", id="prompt-marker", markup=False)
+                yield Prompt(placeholder="Enter to send, Ctrl+J for a new line", id="prompt")
         directory = Path.cwd()
         home = Path.home()
         display_directory = str(Path("~") / directory.relative_to(home)) if directory.is_relative_to(home) else str(directory)
@@ -328,7 +374,7 @@ class RepluxApp(App[None]):
             return
         self._generating = True
         prompt.clear()
-        self.query_one("#status", Static).update("Generating...")
+        self.query_one(TurnActivity).start()
         self._run_reply(user_input)
 
     def action_cancel_or_quit(self) -> None:
@@ -336,7 +382,7 @@ class RepluxApp(App[None]):
             self.exit()
         elif not self._cancelling:
             self._cancelling = True
-            self.query_one("#status", Static).update("Cancelling...")
+            self.query_one(TurnActivity).show_action("Cancelling…")
             if self._reply_task is not None:
                 self._reply_task.cancel()
 
@@ -345,6 +391,10 @@ class RepluxApp(App[None]):
         if transcript.is_vertical_scroll_end:
             # Scrolling past the bottom can release Textual's anchor as well.
             transcript.anchor()
+
+    def _show_activity(self, action: str) -> None:
+        if not self._cancelling:
+            self.query_one(TurnActivity).show_action(action)
 
     @work(name="reply", description="Stream the current reply")
     async def _run_reply(self, user_input: str) -> None:
@@ -368,7 +418,7 @@ class RepluxApp(App[None]):
             self._generating = False
             self._cancelling = False
             if self.is_running:
-                self.query_one("#status", Static).update("Ready")
+                self.query_one(TurnActivity).stop()
 
     async def _show_reply(self, user_input: str) -> None:
         transcript = self.query_one("#transcript-content", Vertical)
@@ -385,6 +435,8 @@ class RepluxApp(App[None]):
             self._follow_transcript()
             if isinstance(event, TextDelta):
                 text += event.text
+                if event.text.strip():
+                    self._show_activity("Writing reply…")
                 if reply is None:
                     if not text.strip():
                         return
@@ -394,6 +446,8 @@ class RepluxApp(App[None]):
                     reply.body.update(text)
             elif isinstance(event, ThinkingDelta) and event.text:
                 thinking_text += event.text
+                if event.text.strip():
+                    self._show_activity("Thinking…")
                 if thinking is None:
                     if not thinking_text.strip():
                         return
@@ -412,7 +466,7 @@ class RepluxApp(App[None]):
                 view = ToolCallView(event.name, event.arguments)
                 tools[event.call_id] = view
                 await transcript.mount(view)
-                self.query_one("#status", Static).update(f"Running {event.name}...")
+                self._show_activity(f"{_tool_title(event.name, event.arguments)}…")
                 reply = None
                 text = ""
             elif isinstance(event, ToolFinished):
@@ -422,42 +476,38 @@ class RepluxApp(App[None]):
                     tools[event.call_id] = finished
                     await transcript.mount(finished)
                 finished.finish(event.result, event.duration_seconds)
-                if not self._cancelling:
-                    self.query_one("#status", Static).update("Generating...")
+                self._show_activity("Working…")
                 reply = None
                 text = ""
-            elif isinstance(event, ReplyCompleted):
-                self.query_one("#status", Static).update("Ready")
 
-        events: AsyncGenerator[StreamEvent, None] | None = None
+        outcome: str | None = None
         try:
             self._follow_transcript()
             await transcript.mount(user)
             if self._cancelling:
                 raise asyncio.CancelledError
             events = self._client.stream_reply(user_input)
-            while True:
-                try:
-                    event = await anext(events)
-                except StopAsyncIteration:
-                    break
-                except asyncio.CancelledError:
-                    raise
-                try:
-                    await show(event)
-                except asyncio.CancelledError:
-                    # The generator is paused on the event just shown. Throw cancellation
-                    # there so an unstarted call stays skipped and the UI can render it.
-                    await _show_after_cancel(events, show)
-                    raise
+            async with aclosing(events):
+                while True:
+                    try:
+                        event = await anext(events)
+                    except StopAsyncIteration:
+                        break
+                    try:
+                        await show(event)
+                    except asyncio.CancelledError:
+                        # The generator is paused on the event just shown. Throw cancellation
+                        # there so an unstarted call stays skipped and the UI can render it.
+                        await _show_after_cancel(events, show)
+                        raise
+            outcome = "Finished in"
         except asyncio.CancelledError:
+            outcome = "Cancelled after"
             for view in tools.values():
                 view.cancel()
-            if self.is_running:
-                self._follow_transcript()
-                await transcript.mount(Static("Cancelled", classes="turn-status", markup=False))
             raise
         except LLMError as error:
+            outcome = "Failed after"
             if isinstance(error, (IncompleteReplyError, ToolBatchLimitError)):
                 message = str(error)
             else:
@@ -465,12 +515,12 @@ class RepluxApp(App[None]):
             self._follow_transcript()
             await transcript.mount(Static(message, classes="turn-status", markup=False))
         finally:
-            try:
-                if events is not None:
-                    await events.aclose()
-            finally:
-                if thinking_control is not None:
-                    thinking_control.title = "Thoughts"
+            if thinking_control is not None:
+                thinking_control.title = "Thoughts"
+            if outcome is not None and self.is_running:
+                elapsed = self.query_one(TurnActivity).elapsed
+                self._follow_transcript()
+                await transcript.mount(Static(f"{outcome} {elapsed:.1f}s", classes="turn-outcome", markup=False))
 
     async def on_unmount(self) -> None:
         try:

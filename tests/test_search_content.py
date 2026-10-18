@@ -631,7 +631,7 @@ async def test_the_ui_summarizes_matching_lines_and_expand_matches_the_model_res
         preview = str(view.query_one(".tool-preview", Static).content)
         assert preview == "└ Returned 7 matching lines"
         assert "hidden hit" not in preview
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Working…"
         output = view.query_one(".tool-details")
         await pilot.click(view.query_one(".tool-heading"))
         expanded = str(output.query_one(".tool-output", Static).content)
@@ -671,12 +671,13 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         await pilot.press("enter")
         await wait_for_tick(marker)
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Running search_content..."
+        assert app.query_one("#status", Static).content == "Search alpha…"
         assert process_state(int(child.read_text())) == "running"
         worker = next(iter(app.workers))
         await pilot.press("ctrl+c")
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Cancelling..."
+        assert app.query_one("#status", Static).content == "Cancelling…"
+        assert not app.query(".turn-outcome")
         assert app.query_one(".tool-dot", Static).has_class("running")
         assert process_state(int(child.read_text())) == "running"
         prompt.text = "草稿"
@@ -688,6 +689,7 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         await pilot.pause()
         assert process_state(int(leader.read_text())) == "dead"
         assert process_state(int(child.read_text())) == "dead"
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
         assert not later.exists()
         assert app.query_one("#status", Static).content == "Ready"
         shown = [status.split(" · ", 1)[0] for status in statuses(app)]

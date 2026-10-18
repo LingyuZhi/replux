@@ -311,7 +311,7 @@ async def test_multiline_input_background_markers_and_body_columns_at_agreed_siz
         assert app.screen.get_style_at(reply.region.x - 2, reply.region.y).color == foreground
         assert app.screen.get_style_at(heading.region.x - 2, heading.region.y).color != foreground
         screenshot = unescape(app.export_screenshot()).replace("\xa0", " ")
-        assert screenshot.count("›") == 1
+        assert screenshot.count("›") == 2
         assert screenshot.count("●") == 2
         assert "[bold]literal[/bold]" in screenshot
         assert "[bold]Plain reply[/bold]" in screenshot

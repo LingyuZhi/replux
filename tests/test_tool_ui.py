@@ -6,7 +6,6 @@ from pathlib import Path
 
 import pytest
 import httpx2 as httpx
-from textual.pilot import Pilot
 from textual.widgets import Static, TextArea
 from textual.worker import WorkerCancelled, WorkerFailed
 
@@ -28,16 +27,7 @@ def visible_text(app: RepluxApp) -> str:
     return unescape(app.export_screenshot()).replace("\xa0", " ")
 
 
-async def wait_for_opacity_change(pilot: Pilot[None], dot: Static) -> None:
-    initial = dot.styles.text_opacity
-    for _ in range(40):
-        await pilot.pause(0.05)
-        if dot.styles.text_opacity != initial:
-            return
-    raise AssertionError("the running dot did not breathe")
-
-
-async def test_running_tool_breathes_then_shows_summary_and_expandable_result() -> None:
+async def test_running_tool_stays_static_while_bottom_activity_animates() -> None:
     class ScriptedClient(LLMClient):
         def __init__(self) -> None:
             self.inputs: list[str] = []
@@ -73,8 +63,12 @@ async def test_running_tool_breathes_then_shows_summary_and_expandable_result() 
         assert dot.has_class("running")
         assert view.query_one(".tool-header", Static).content == "Read notes.txt"
         assert view.query_one(".tool-status", Static).content == "Running"
-        assert app.query_one("#status", Static).content == "Running read_file..."
-        await wait_for_opacity_change(pilot, dot)
+        assert app.query_one("#status", Static).content == "Read notes.txt…"
+        activity = app.query_one("#activity-dot", Static)
+        first_frame = activity.content
+        await pilot.pause(0.6)
+        assert activity.content != first_frame
+        assert dot.styles.text_opacity == 1.0
         await pilot.press(*"草稿", "enter")
         assert client.inputs == ["读一下 notes.txt"]
         assert prompt.text == "草稿"
@@ -91,9 +85,7 @@ async def test_running_tool_breathes_then_shows_summary_and_expandable_result() 
         assert not output.display
         assert view.query_one(".tool-arrow", Static).content == "▸"
         assert "line 8" not in visible_text(app)
-        assert app.query_one("#status", Static).content == "Generating..."
-        await pilot.pause(0.6)
-        assert dot.styles.text_opacity == 1.0
+        assert app.query_one("#status", Static).content == "Working…"
 
         await pilot.click(view.query_one(".tool-heading"))
         assert output.display
@@ -105,6 +97,10 @@ async def test_running_tool_breathes_then_shows_summary_and_expandable_result() 
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
+        last_frame = activity.content
+        await pilot.pause(0.15)
+        assert activity.content == last_frame
+        assert not activity.display
         user = app.query_one(".user", Static)
         before, after = app.query(".reply").results(Static)
         assert user.content == "读一下 notes.txt"
@@ -145,7 +141,7 @@ async def test_failed_and_skipped_calls_keep_their_states() -> None:
         assert app.query_one("#status", Static).content == "Ready"
 
 
-async def test_cancelling_a_running_tool_stops_its_animation() -> None:
+async def test_cancelling_a_running_tool_keeps_its_status_and_ends_bottom_activity() -> None:
     class ScriptedClient(LLMClient):
         def __init__(self) -> None:
             self.started = asyncio.Event()
@@ -176,7 +172,7 @@ async def test_cancelling_a_running_tool_stops_its_animation() -> None:
         dot = view.query_one(".tool-dot", Static)
         assert not dot.has_class("running")
         assert dot.styles.text_opacity == 1.0
-        assert app.query_one(".turn-status", Static).content == "Cancelled"
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
         assert app.query_one("#status", Static).content == "Ready"
 
 
@@ -201,7 +197,8 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         assert view.query_one(".tool-header", Static).content == "Read notes.txt"
         assert view.query_one(".tool-status", Static).content == "Success"
         assert view.query_one(".tool-preview", Static).content == "└ Lines 1–8"
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Working…"
+        assert not app.query(".turn-outcome")
         output = view.query_one(".tool-details")
         await pilot.click(view.query_one(".tool-heading"))
         assert output.query_one(".tool-output", Static).content == EIGHT_LINES
@@ -264,7 +261,8 @@ async def test_a_failed_batch_shows_each_result_and_finishes_after_the_summary(
         assert views[1].query_one(".tool-dot", Static).has_class("error")
         assert not views[2].query_one(".tool-dot", Static).has_class("running")
         assert "should-not" not in visible_text(app)
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Working…"
+        assert not app.query(".turn-outcome")
         if protocol == "anthropic":
             assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
         summary.release.set()
@@ -272,6 +270,7 @@ async def test_a_failed_batch_shows_each_result_and_finishes_after_the_summary(
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
         assert str(views[1].query_one(".tool-status", Static).content).startswith("Failed")
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Finished in ")
         assert [reply.content for reply in app.query(".reply").results(Static)][-1] == "你好，世界\n"
     assert "should-not" not in transport.requests[1].content.decode()
 
@@ -295,6 +294,7 @@ async def test_unpairable_tool_calls_report_an_error_and_accept_another_turn(
         await pilot.pause()
         assert not app.query(ToolCallView)
         assert "missing or duplicate" in str(app.query_one(".turn-status", Static).content)
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Failed after ")
         assert app.query_one("#status", Static).content == "Ready"
         prompt.text = "follow-up"
         await pilot.press("enter")
@@ -322,6 +322,7 @@ async def test_cleanup_failure_shows_an_error_and_accepts_another_turn(
         await pilot.pause()
         assert not app.query(ToolCallView)
         assert "Request failed" in str(app.query_one(".turn-status", Static).content)
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Failed after ")
         assert app.query_one("#status", Static).content == "Ready"
         prompt.text = "follow-up"
         await pilot.press("enter")
@@ -353,6 +354,7 @@ async def test_a_second_tool_batch_stops_the_turn_and_keeps_the_finished_tool(
         assert len(statuses(app)) == 1
         assert statuses(app)[0].startswith("Success")
         assert "tool batch" in str(app.query_one(".turn-status", Static).content)
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Failed after ")
         assert "should-not" not in visible_text(app)
         assert app.query_one("#status", Static).content == "Ready"
         prompt.text = "follow-up"
@@ -384,12 +386,13 @@ async def test_cancelling_the_summary_keeps_tool_results_and_restores_input(
         await asyncio.wait_for(summary.blocked.wait(), timeout=2)
         await pilot.pause()
         assert statuses(app)[0].startswith("Success")
-        assert app.query_one("#status", Static).content == "Generating..."
+        assert app.query_one("#status", Static).content == "Writing reply…"
         worker = next(iter(app.workers))
         try:
             await pilot.press("ctrl+c")
             await asyncio.wait_for(summary.closing.wait(), timeout=2)
-            assert app.query_one("#status", Static).content == "Cancelling..."
+            assert app.query_one("#status", Static).content == "Cancelling…"
+            assert not app.query(".turn-outcome")
             assert statuses(app)[0].startswith("Success")
             prompt.text = "草稿"
             await pilot.press("enter", "ctrl+c")
@@ -402,7 +405,7 @@ async def test_cancelling_the_summary_keeps_tool_results_and_restores_input(
                 await asyncio.wait_for(worker.wait(), timeout=2)
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
-        assert str(app.query_one(".turn-status", Static).content) == "Cancelled"
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
         assert statuses(app)[0].startswith("Success")
         prompt.text = "follow-up"
         await pilot.press("enter")
@@ -433,7 +436,7 @@ async def test_tool_cleanup_blocks_submit_then_shows_cancelled_and_skipped(
         await asyncio.wait_for(tool.entered.wait(), timeout=2)
         await pilot.pause()
         assert statuses(app) == ["Running"]
-        assert app.query_one("#status", Static).content == "Running read_file..."
+        assert app.query_one("#status", Static).content == "Read ok.txt…"
         if protocol == "anthropic":
             assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
         prompt.text = "草稿"
@@ -443,11 +446,13 @@ async def test_tool_cleanup_blocks_submit_then_shows_cancelled_and_skipped(
         worker = next(iter(app.workers))
         await pilot.press("ctrl+c")
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Cancelling..."
+        assert app.query_one("#status", Static).content == "Cancelling…"
+        assert not app.query(".turn-outcome")
         assert app.query_one(".tool-dot", Static).has_class("running")
         prompt.text = "草稿仍可编辑"
         await pilot.press("enter", "ctrl+c")
-        assert app.query_one("#status", Static).content == "Cancelling..."
+        assert app.query_one("#status", Static).content == "Cancelling…"
+        assert not app.query(".turn-outcome")
         assert not tool.stopped.is_set()
         assert not side_effect.exists()
         tool.release.set()
@@ -456,7 +461,7 @@ async def test_tool_cleanup_blocks_submit_then_shows_cancelled_and_skipped(
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
         assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["Cancelled", "Skipped"]
-        assert str(app.query_one(".turn-status", Static).content) == "Cancelled"
+        assert str(app.query_one(".turn-outcome", Static).content).startswith("Cancelled after ")
         assert prompt.text == "草稿仍可编辑"
         if protocol == "anthropic":
             assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
@@ -526,7 +531,7 @@ async def test_an_internal_tool_error_terminates_the_chat_after_cleanup(protocol
             await pilot.press("enter")
             await asyncio.wait_for(tool.entered.wait(), timeout=2)
             await pilot.pause()
-            assert str(app.query_one("#status", Static).content).startswith("Running")
+            assert app.query_one("#status", Static).content == "Read ok.txt…"
             tool.release.set()
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
     assert app.return_code == 1
