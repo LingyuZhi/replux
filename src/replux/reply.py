@@ -17,6 +17,8 @@ from textual.widgets import Markdown, Static
 from textual.widgets._markdown import MarkdownBullet, MarkdownTable, MarkdownTableContent
 from textual.widgets.markdown import MarkdownBlock, MarkdownFence
 
+from replux.transcript import ThinScrollBarRender
+
 
 class ReplyCodeTheme(HighlightTheme):
     STYLES = {
@@ -37,6 +39,9 @@ class ReplyHorizontal(MarkdownBlock, can_focus=True):
         Binding("left", "scroll_horizontal(-4)", "Scroll left", show=False),
         Binding("right", "scroll_horizontal(4)", "Scroll right", show=False),
     ]
+
+    def on_mount(self) -> None:
+        setattr(self.horizontal_scrollbar, "renderer", ThinScrollBarRender)
 
     def allow_focus(self) -> bool:
         return self.show_horizontal_scrollbar
@@ -186,15 +191,10 @@ class ReplyMarkdown(Markdown):
             overflow: auto hidden;
             scrollbar-size-horizontal: 1;
             scrollbar-size-vertical: 0;
-            scrollbar-color: $foreground 30%;
-            scrollbar-background: $foreground 4%;
-            scrollbar-color-hover: #c6b8eb 55%;
-            scrollbar-color-active: #c6b8eb 65%;
         }
         ReplyHorizontal:focus {
             background-tint: #c6b8eb 8%;
             outline-left: solid #c6b8eb 50%;
-            scrollbar-color: #c6b8eb 65%;
         }
         ReplyFence > Label { padding: 0 1; text-wrap: nowrap; }
         ReplyTable { margin-bottom: 1; }

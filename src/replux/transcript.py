@@ -1,4 +1,4 @@
-"""Keep visible Transcript content in place when streamed content changes height."""
+"""Render thin scrollbars and retain the visible Transcript during streamed updates."""
 
 import asyncio
 from collections.abc import AsyncIterator
@@ -6,10 +6,35 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
+from rich.console import Console, ConsoleOptions, RenderResult
+from rich.segment import Segment
+from rich.style import Style
+from textual.color import Color
 from textual.containers import VerticalScroll
 from textual.geometry import Region
+from textual.scrollbar import ScrollBarRender
 from textual.widgets import Markdown, Static
 from textual.widgets.markdown import MarkdownBlock
+
+
+class ThinScrollBarRender(ScrollBarRender):
+    def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        style = console.get_style(self.style)
+        background, thumb = style.bgcolor, style.color
+        assert background is not None and thumb is not None
+        track = Color.from_rich_color(background).blend(Color(128, 128, 128), 0.18).rich_color
+        stroke = "▏" if self.vertical else "▁"
+        for renderable in super().__rich_console__(console, options):
+            segments = (renderable,) if isinstance(renderable, Segment) else console.render(renderable, options)
+            for segment in segments:
+                if segment.control or segment.text == "\n":
+                    yield segment
+                    continue
+                assert segment.style is not None
+                # Keep full-cell hit targets and native thumb / page actions.
+                meta = segment.style.meta
+                color = thumb if meta.get("@mouse.down") == "grab" else track
+                yield Segment(stroke * segment.cell_length, Style(color=color, bgcolor=background, meta=meta))
 
 
 @dataclass
@@ -51,6 +76,9 @@ class TranscriptScroll(VerticalScroll):
         super().__init__(id=id)
         self._reading_anchors: list[ReadingAnchor] = []
         self._reading_scroll_y = 0.0
+
+    def on_mount(self) -> None:
+        setattr(self.vertical_scrollbar, "renderer", ThinScrollBarRender)
 
     @asynccontextmanager
     async def preserve_reading_position(self) -> AsyncIterator[None]:

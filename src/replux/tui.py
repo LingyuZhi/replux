@@ -26,7 +26,7 @@ from replux.llm import (
 )
 from replux.tools import ToolResult
 from replux.reply import ReplyMessage
-from replux.transcript import TranscriptScroll
+from replux.transcript import ThinScrollBarRender, TranscriptScroll
 
 
 SPARK_LOGO = "\n".join((
@@ -252,6 +252,9 @@ async def _show_after_cancel(
 
 
 class Prompt(TextArea):
+    def on_mount(self) -> None:
+        setattr(self.vertical_scrollbar, "renderer", ThinScrollBarRender)
+
     async def on_key(self, event: Key) -> None:
         if event.key in {"enter", "ctrl+j"}:
             # Keep submission and newlines ordered with typing and paste events.
@@ -317,6 +320,19 @@ class RepluxApp(App[None]):
     TITLE = "Replux"
     BINDINGS = [Binding("ctrl+c", "cancel_or_quit", "Cancel / Quit", priority=True)]
     CSS = """
+    #transcript, #prompt, ReplyHorizontal {
+        scrollbar-size: 1 1;
+        scrollbar-color: #626262;
+        scrollbar-color-hover: #858585;
+        scrollbar-color-active: #999999;
+        scrollbar-background: transparent;
+        scrollbar-background-hover: transparent;
+        scrollbar-background-active: transparent;
+        scrollbar-corner-color: transparent;
+    }
+    #transcript:focus-within, #prompt:focus, ReplyHorizontal:focus {
+        scrollbar-color: #858585;
+    }
     #composer { dock: bottom; height: auto; }
     #prompt-entry { height: auto; border-top: solid $foreground 20%; padding: 0 2; }
     #prompt-marker { width: 2; height: 1; }
