@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import httpx2 as httpx
 from textual.pilot import Pilot
-from textual.widgets import Collapsible, Static, TextArea
+from textual.widgets import Static, TextArea
 from textual.worker import WorkerCancelled, WorkerFailed
 
 from replux.cli import create_app
@@ -37,7 +37,7 @@ async def wait_for_opacity_change(pilot: Pilot[None], dot: Static) -> None:
     raise AssertionError("the running dot did not breathe")
 
 
-async def test_running_tool_breathes_then_shows_status_preview_and_expandable_result() -> None:
+async def test_running_tool_breathes_then_shows_summary_and_expandable_result() -> None:
     class ScriptedClient(LLMClient):
         def __init__(self) -> None:
             self.inputs: list[str] = []
@@ -47,10 +47,11 @@ async def test_running_tool_breathes_then_shows_status_preview_and_expandable_re
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
             self.inputs.append(user_input)
             yield TextDelta("我先读文件。")
-            yield ToolStarted("call_1", "read_file", "path=notes.txt")
+            yield ToolStarted("call_1", "read_file", "path=notes.txt", '{"path": "notes.txt"}')
             self.reached[0].set()
             await self.release[0].wait()
-            yield ToolFinished("call_1", "read_file", "path=notes.txt", ToolResult("success", EIGHT_LINES), 0.25)
+            result = ToolResult("success", EIGHT_LINES, details={"start_line": 1, "end_line": 8})
+            yield ToolFinished("call_1", "read_file", "path=notes.txt", result, 0.25, '{"path": "notes.txt"}')
             self.reached[1].set()
             await self.release[1].wait()
             yield TextDelta("文件有八行。")
@@ -70,8 +71,8 @@ async def test_running_tool_breathes_then_shows_status_preview_and_expandable_re
         view = app.query_one(ToolCallView)
         dot = view.query_one(".tool-dot", Static)
         assert dot.has_class("running")
-        assert view.query_one(".tool-header", Static).content == "read_file path=notes.txt"
-        assert view.query_one(".tool-status", Static).content == "running"
+        assert view.query_one(".tool-header", Static).content == "Read notes.txt"
+        assert view.query_one(".tool-status", Static).content == "Running"
         assert app.query_one("#status", Static).content == "Running read_file..."
         await wait_for_opacity_change(pilot, dot)
         await pilot.press(*"草稿", "enter")
@@ -83,19 +84,19 @@ async def test_running_tool_breathes_then_shows_status_preview_and_expandable_re
         await pilot.pause()
         assert not dot.has_class("running")
         assert dot.styles.text_opacity == 1.0
-        assert view.query_one(".tool-status", Static).content == "success · 0.25s"
+        assert view.query_one(".tool-status", Static).content == "Success"
         preview = view.query_one(".tool-preview", Static)
-        assert preview.content == "\n".join(EIGHT_LINES.split("\n")[:5])
-        output = view.query_one(Collapsible)
-        assert output.collapsed
-        assert str(output.query_one("CollapsibleTitle", Static).content) == "+ Show all 8 lines"
+        assert preview.content == "└ Lines 1–8"
+        output = view.query_one(".tool-details")
+        assert not output.display
+        assert view.query_one(".tool-arrow", Static).content == "▸"
         assert "line 8" not in visible_text(app)
         assert app.query_one("#status", Static).content == "Generating..."
         await pilot.pause(0.6)
         assert dot.styles.text_opacity == 1.0
 
-        await pilot.click(output.query_one("CollapsibleTitle", Static), offset=(1, 0))
-        assert not output.collapsed
+        await pilot.click(view.query_one(".tool-heading"))
+        assert output.display
         assert output.query_one(".tool-output", Static).content == EIGHT_LINES
         assert not preview.display
         assert "line 8" in visible_text(app)
@@ -116,11 +117,11 @@ async def test_running_tool_breathes_then_shows_status_preview_and_expandable_re
 async def test_failed_and_skipped_calls_keep_their_states() -> None:
     class ScriptedClient(LLMClient):
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
-            yield ToolStarted("call_1", "read_file", "path=absent.txt")
+            yield ToolStarted("call_1", "read_file", "path=absent.txt", '{"path": "absent.txt"}')
             missing = ToolResult("error", "File not found: absent.txt.", "file_not_found")
-            yield ToolFinished("call_1", "read_file", "path=absent.txt", missing, 0.012)
+            yield ToolFinished("call_1", "read_file", "path=absent.txt", missing, 0.012, '{"path": "absent.txt"}')
             skipped = ToolResult("skipped", "Not run because an earlier tool call in this batch did not succeed.")
-            yield ToolFinished("call_2", "read_file", "path=b.txt", skipped, None)
+            yield ToolFinished("call_2", "read_file", "path=b.txt", skipped, None, '{"path": "b.txt"}')
             yield TextDelta("没有找到文件。")
             yield ReplyCompleted("end_turn", None, None)
 
@@ -133,13 +134,14 @@ async def test_failed_and_skipped_calls_keep_their_states() -> None:
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         failed, skipped = app.query(ToolCallView).results(ToolCallView)
-        assert failed.query_one(".tool-status", Static).content == "error (file_not_found) · 0.01s"
-        assert failed.query_one(".tool-preview", Static).content == "File not found: absent.txt."
+        assert failed.query_one(".tool-status", Static).content == "Failed"
+        assert failed.query_one(".tool-preview", Static).content == "└ File not found: absent.txt."
         assert failed.query_one(".tool-dot", Static).has_class("error")
-        assert skipped.query_one(".tool-header", Static).content == "read_file path=b.txt"
-        assert skipped.query_one(".tool-status", Static).content == "skipped"
+        assert skipped.query_one(".tool-header", Static).content == "Read b.txt"
+        assert skipped.query_one(".tool-status", Static).content == "Skipped"
         assert not skipped.query_one(".tool-dot", Static).has_class("running")
-        assert not app.query(".tool-call Collapsible")
+        assert not failed.query_one(".tool-details").display
+        assert not skipped.query_one(".tool-details").display
         assert app.query_one("#status", Static).content == "Ready"
 
 
@@ -149,7 +151,7 @@ async def test_cancelling_a_running_tool_stops_its_animation() -> None:
             self.started = asyncio.Event()
 
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
-            yield ToolStarted("call_1", "read_file", "path=notes.txt")
+            yield ToolStarted("call_1", "read_file", "path=notes.txt", '{"path": "notes.txt"}')
             self.started.set()
             await asyncio.Event().wait()
             yield ReplyCompleted("end_turn", None, None)
@@ -170,7 +172,7 @@ async def test_cancelling_a_running_tool_stops_its_animation() -> None:
             await asyncio.wait_for(worker.wait(), timeout=2)
         await pilot.pause()
         view = app.query_one(ToolCallView)
-        assert view.query_one(".tool-status", Static).content == "cancelled"
+        assert view.query_one(".tool-status", Static).content == "Cancelled"
         dot = view.query_one(".tool-dot", Static)
         assert not dot.has_class("running")
         assert dot.styles.text_opacity == 1.0
@@ -196,12 +198,12 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         await asyncio.wait_for(summary.blocked.wait(), timeout=2)
         await pilot.pause()
         view = app.query_one(ToolCallView)
-        assert view.query_one(".tool-header", Static).content == "read_file path=notes.txt"
-        assert str(view.query_one(".tool-status", Static).content).startswith("success · ")
-        assert view.query_one(".tool-preview", Static).content == "\n".join(f"{n}\tline {n}" for n in range(1, 6))
+        assert view.query_one(".tool-header", Static).content == "Read notes.txt"
+        assert view.query_one(".tool-status", Static).content == "Success"
+        assert view.query_one(".tool-preview", Static).content == "└ Lines 1–8"
         assert app.query_one("#status", Static).content == "Generating..."
-        output = view.query_one(Collapsible)
-        await pilot.click(output.query_one("CollapsibleTitle", Static), offset=(1, 0))
+        output = view.query_one(".tool-details")
+        await pilot.click(view.query_one(".tool-heading"))
         assert output.query_one(".tool-output", Static).content == EIGHT_LINES
         assert len(transport.requests) == 2
         summary.release.set()
@@ -255,9 +257,9 @@ async def test_a_failed_batch_shows_each_result_and_finishes_after_the_summary(
         await pilot.press("enter")
         await asyncio.wait_for(summary.blocked.wait(), timeout=2)
         await pilot.pause()
-        assert statuses(app)[0].startswith("success · ")
-        assert statuses(app)[1].startswith("error (file_not_found) · ")
-        assert statuses(app)[2] == "skipped"
+        assert statuses(app)[0].startswith("Success")
+        assert statuses(app)[1].startswith("Failed")
+        assert statuses(app)[2] == "Skipped"
         views = list(app.query(ToolCallView).results(ToolCallView))
         assert views[1].query_one(".tool-dot", Static).has_class("error")
         assert not views[2].query_one(".tool-dot", Static).has_class("running")
@@ -269,7 +271,7 @@ async def test_a_failed_batch_shows_each_result_and_finishes_after_the_summary(
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
-        assert str(views[1].query_one(".tool-status", Static).content).startswith("error (file_not_found)")
+        assert str(views[1].query_one(".tool-status", Static).content).startswith("Failed")
         assert [reply.content for reply in app.query(".reply").results(Static)][-1] == "你好，世界\n"
     assert "should-not" not in transport.requests[1].content.decode()
 
@@ -349,7 +351,7 @@ async def test_a_second_tool_batch_stops_the_turn_and_keeps_the_finished_tool(
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
         await pilot.pause()
         assert len(statuses(app)) == 1
-        assert statuses(app)[0].startswith("success · ")
+        assert statuses(app)[0].startswith("Success")
         assert "tool batch" in str(app.query_one(".turn-status", Static).content)
         assert "should-not" not in visible_text(app)
         assert app.query_one("#status", Static).content == "Ready"
@@ -381,14 +383,14 @@ async def test_cancelling_the_summary_keeps_tool_results_and_restores_input(
         await pilot.press("enter")
         await asyncio.wait_for(summary.blocked.wait(), timeout=2)
         await pilot.pause()
-        assert statuses(app)[0].startswith("success · ")
+        assert statuses(app)[0].startswith("Success")
         assert app.query_one("#status", Static).content == "Generating..."
         worker = next(iter(app.workers))
         try:
             await pilot.press("ctrl+c")
             await asyncio.wait_for(summary.closing.wait(), timeout=2)
             assert app.query_one("#status", Static).content == "Cancelling..."
-            assert statuses(app)[0].startswith("success · ")
+            assert statuses(app)[0].startswith("Success")
             prompt.text = "草稿"
             await pilot.press("enter", "ctrl+c")
             assert prompt.text == "草稿"
@@ -401,7 +403,7 @@ async def test_cancelling_the_summary_keeps_tool_results_and_restores_input(
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
         assert str(app.query_one(".turn-status", Static).content) == "Cancelled"
-        assert statuses(app)[0].startswith("success · ")
+        assert statuses(app)[0].startswith("Success")
         prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -430,7 +432,7 @@ async def test_tool_cleanup_blocks_submit_then_shows_cancelled_and_skipped(
         await pilot.press("enter")
         await asyncio.wait_for(tool.entered.wait(), timeout=2)
         await pilot.pause()
-        assert statuses(app) == ["running"]
+        assert statuses(app) == ["Running"]
         assert app.query_one("#status", Static).content == "Running read_file..."
         if protocol == "anthropic":
             assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
@@ -453,7 +455,7 @@ async def test_tool_cleanup_blocks_submit_then_shows_cancelled_and_skipped(
             await asyncio.wait_for(worker.wait(), timeout=2)
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
-        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["cancelled", "skipped"]
+        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["Cancelled", "Skipped"]
         assert str(app.query_one(".turn-status", Static).content) == "Cancelled"
         assert prompt.text == "草稿仍可编辑"
         if protocol == "anthropic":
@@ -498,7 +500,7 @@ async def test_cancel_while_showing_a_tool_keeps_unstarted_calls_skipped(
         prompt.text = "read them"
         await pilot.press("enter")
         await pilot.pause()
-        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["skipped", "skipped"]
+        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["Skipped", "Skipped"]
         assert app.query_one("#status", Static).content == "Ready"
         prompt.text = "follow-up"
         await pilot.press("enter")

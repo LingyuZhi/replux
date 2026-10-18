@@ -37,6 +37,7 @@ class ToolStarted:
     call_id: str
     name: str
     summary: str
+    arguments: str
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class ToolFinished:
     summary: str
     result: ToolResult
     duration_seconds: float | None
+    arguments: str
 
 
 @dataclass(frozen=True)
@@ -306,6 +308,7 @@ class Conversation(LLMClient, Generic[ContextItem]):
                         for call, result in results[shown:]:
                             yield ToolFinished(
                                 call.id, call.name, summarize_arguments(call.arguments), result, durations.get(call.id),
+                                call.arguments,
                             )
                     raise
                 self._context.extend([*uncommitted, *self._adapter.tool_results(results)])
@@ -326,9 +329,9 @@ class Conversation(LLMClient, Generic[ContextItem]):
             if results and results[-1][1].status != "success":
                 result = ToolResult("skipped", "Not run because an earlier tool call in this batch did not succeed.")
                 results.append((call, result))
-                yield ToolFinished(call.id, call.name, summary, result, None)
+                yield ToolFinished(call.id, call.name, summary, result, None, call.arguments)
                 continue
-            yield ToolStarted(call.id, call.name, summary)
+            yield ToolStarted(call.id, call.name, summary, call.arguments)
             started = time.monotonic()
             try:
                 result = await self._tools.execute(call.name, call.arguments)
@@ -343,7 +346,7 @@ class Conversation(LLMClient, Generic[ContextItem]):
                 results.append((call, result))
                 raise asyncio.CancelledError
             results.append((call, result))
-            yield ToolFinished(call.id, call.name, summary, result, time.monotonic() - started)
+            yield ToolFinished(call.id, call.name, summary, result, time.monotonic() - started, call.arguments)
 
     async def aclose(self) -> None:
         try:

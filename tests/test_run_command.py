@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 import httpx2 as httpx
-from textual.widgets import Collapsible, Static, TextArea
+from textual.widgets import Static, TextArea
 from textual.worker import WorkerCancelled
 
 from replux.cli import create_app
@@ -827,7 +827,7 @@ async def test_an_unfinished_command_response_has_no_side_effect(
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
-async def test_the_ui_previews_the_tail_and_expand_does_not_read_the_log(
+async def test_the_ui_summarizes_the_command_and_expand_does_not_read_the_log(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
 ) -> None:
     monkeypatch.chdir(tmp_path)
@@ -849,15 +849,15 @@ async def test_the_ui_previews_the_tail_and_expand_does_not_read_the_log(
             await pilot.pause()
             view = app.query_one(".tool-call")
             preview = str(view.query_one(".tool-preview", Static).content)
-            assert preview.split("\n")[-1] == "L12"
-            assert "L1" not in preview.split("\n")
-            assert len(preview.split("\n")) <= 5
+            assert preview == "└ Truncated · Exited with code 0"
             log_path = Path(str(view.query_one(".tool-log", Static).content))
             assert log_path.read_text(encoding="utf-8").startswith("L1\n")
             assert app.query_one("#status", Static).content == "Generating..."
             log_path.write_text("SECRET LOG", encoding="utf-8")
-            output = view.query_one(Collapsible)
-            await pilot.click(output.query_one("CollapsibleTitle", Static), offset=(1, 0))
+            output = view.query_one(".tool-details")
+            assert not output.display
+            await pilot.click(view.query_one(".tool-heading"))
+            assert output.display
             expanded = str(output.query_one(".tool-output", Static).content)
             assert "SECRET LOG" not in expanded
             assert "L12" in expanded
@@ -912,7 +912,7 @@ async def test_the_ui_stays_cancelling_until_the_process_group_is_reaped(
             assert app.query_one("#status", Static).content == "Ready"
             shown = [status.split(" · ", 1)[0] for status in statuses(app)]
             preview = str(app.query_one(".tool-preview", Static).content)
-            assert shown == ["cancelled", "skipped"], preview
+            assert shown == ["Cancelled", "Skipped"], preview
             prompt.text = "follow-up"
             await pilot.press("enter")
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)

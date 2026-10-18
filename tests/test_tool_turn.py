@@ -78,8 +78,8 @@ async def test_anthropic_reads_a_real_file_and_summarizes_with_tools_disabled(
     assert isinstance(finished, ToolFinished) and finished.duration_seconds is not None
     assert received == [
         ThinkingDelta("先看文件"), TextDelta("我先读文件。"),
-        ToolStarted("toolu_read", "read_file", "path=notes.txt"),
-        ToolFinished("toolu_read", "read_file", "path=notes.txt", result, finished.duration_seconds),
+        ToolStarted("toolu_read", "read_file", "path=notes.txt", '{"path": "notes.txt"}'),
+        ToolFinished("toolu_read", "read_file", "path=notes.txt", result, finished.duration_seconds, '{"path": "notes.txt"}'),
         TextDelta("你好"), TextDelta("，世界\n"), ReplyCompleted("end_turn", 11, 5),
     ]
     first, summary, follow_up = (json.loads(request.content) for request in transport.requests)
@@ -131,10 +131,10 @@ async def test_responses_reads_real_files_and_pairs_results_by_call_id(
     assert all(duration is not None for duration in durations)
     assert received == [
         TextDelta("我先读文件。"),
-        ToolStarted("call_notes", "read_file", "path=notes.txt"),
-        ToolFinished("call_notes", "read_file", "path=notes.txt", notes, durations[0]),
-        ToolStarted("call_other", "read_file", "path=other.txt"),
-        ToolFinished("call_other", "read_file", "path=other.txt", other, durations[1]),
+        ToolStarted("call_notes", "read_file", "path=notes.txt", '{"path": "notes.txt"}'),
+        ToolFinished("call_notes", "read_file", "path=notes.txt", notes, durations[0], '{"path": "notes.txt"}'),
+        ToolStarted("call_other", "read_file", "path=other.txt", '{"path": "other.txt"}'),
+        ToolFinished("call_other", "read_file", "path=other.txt", other, durations[1], '{"path": "other.txt"}'),
         TextDelta("你好"), TextDelta("，世界\n"), ReplyCompleted("completed", 11, 5),
     ]
     first, summary, follow_up = (json.loads(request.content) for request in transport.requests)

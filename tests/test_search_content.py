@@ -8,7 +8,7 @@ import time
 from typing import Any
 
 import pytest
-from textual.widgets import Collapsible, Static, TextArea
+from textual.widgets import Static, TextArea
 from textual.worker import WorkerCancelled
 
 from replux.cli import create_app
@@ -608,7 +608,7 @@ async def test_cancelling_a_search_skips_the_rest_of_the_batch(
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
-async def test_the_ui_previews_the_head_and_expand_matches_the_model_result(
+async def test_the_ui_summarizes_matching_lines_and_expand_matches_the_model_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
 ) -> None:
     (tmp_path / "notes.txt").write_text("".join(f"hit {number}\n" for number in range(1, 8)), encoding="utf-8")
@@ -626,15 +626,14 @@ async def test_the_ui_previews_the_head_and_expand_matches_the_model_result(
         await asyncio.wait_for(summary.blocked.wait(), timeout=2)
         await pilot.pause()
         view = app.query_one(".tool-call")
-        assert view.query_one(".tool-header", Static).content == "search_content pattern=hit"
-        assert str(view.query_one(".tool-status", Static).content).startswith("success · ")
+        assert view.query_one(".tool-header", Static).content == f"Search hit in {tmp_path}"
+        assert view.query_one(".tool-status", Static).content == "Success"
         preview = str(view.query_one(".tool-preview", Static).content)
-        assert preview == "\n".join(f"notes.txt:{number}:hit {number}" for number in range(1, 6))
-        assert "hit 6" not in preview.split("\n")
+        assert preview == "└ Returned 7 matching lines"
         assert "hidden hit" not in preview
         assert app.query_one("#status", Static).content == "Generating..."
-        output = view.query_one(Collapsible)
-        await pilot.click(output.query_one("CollapsibleTitle", Static), offset=(1, 0))
+        output = view.query_one(".tool-details")
+        await pilot.click(view.query_one(".tool-heading"))
         expanded = str(output.query_one(".tool-output", Static).content)
         assert len(transport.requests) == 2
         summary.release.set()
@@ -692,7 +691,7 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         assert not later.exists()
         assert app.query_one("#status", Static).content == "Ready"
         shown = [status.split(" · ", 1)[0] for status in statuses(app)]
-        assert shown == ["cancelled", "skipped"]
+        assert shown == ["Cancelled", "Skipped"]
         prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)

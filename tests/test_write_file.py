@@ -614,9 +614,9 @@ async def test_the_ui_shows_a_real_write_and_stays_busy_until_the_summary(
         await pilot.pause()
         assert (tmp_path / "pkg" / "notes.txt").read_bytes() == b"hello"
         view = app.query_one(".tool-call")
-        assert "write_file" in str(view.query_one(".tool-header", Static).content)
+        assert view.query_one(".tool-header", Static).content == "Write pkg/notes.txt"
         assert "pkg/notes.txt" in str(view.query_one(".tool-header", Static).content)
-        assert str(view.query_one(".tool-status", Static).content).startswith("success · ")
+        assert str(view.query_one(".tool-status", Static).content).startswith("Success")
         assert "Wrote" in str(view.query_one(".tool-preview", Static).content)
         assert app.query_one("#status", Static).content == "Generating..."
         summary.release.set()
@@ -647,7 +647,10 @@ async def test_the_ui_shows_a_failed_write_batch_without_changing_the_skipped_fi
         await pilot.press("enter")
         await asyncio.wait_for(summary.blocked.wait(), timeout=2)
         await pilot.pause()
-        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["success", "error (not_a_file)", "skipped"]
+        assert statuses(app) == ["Success", "Failed", "Skipped"]
+        failed = list(app.query(".tool-call"))[1]
+        await pilot.click(failed.query_one(".tool-heading"))
+        assert "Error code: not_a_file" in str(failed.query_one(".tool-metadata", Static).content)
         assert app.query_one("#status", Static).content == "Generating..."
         summary.release.set()
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
@@ -699,7 +702,7 @@ async def test_the_ui_stays_cancelling_until_an_in_progress_commit_finishes(
         assert (tmp_path / "later.txt").read_bytes() == b"keep"
         assert list(tmp_path.glob(".replux-*")) == []
         assert app.query_one("#status", Static).content == "Ready"
-        assert [status.split(" · ", 1)[0] for status in statuses(app)] == ["success", "skipped"]
+        assert statuses(app) == ["Success", "Skipped"]
         prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)

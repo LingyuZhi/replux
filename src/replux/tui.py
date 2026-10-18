@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from importlib.metadata import version
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -10,7 +11,8 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Key
+from textual.events import Click, Key
+from textual.message import Message
 from textual.timer import Timer
 from textual.worker import WorkerCancelled
 from textual.widgets import Collapsible, Static, TextArea
@@ -29,6 +31,8 @@ SPARK_LOGO = "\n".join((
     "  ▀▀█████▀▀  ",
     "     ▀█▀     ",
 ))
+
+_TOOL_STATUS_LABELS = {"success": "Success", "error": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"}
 
 
 class TranscriptMessage(Horizontal):
@@ -53,23 +57,50 @@ class ThinkingView(Collapsible):
         self.post_message(self.Collapsed(self) if collapsed else self.Expanded(self))
 
 
-class ToolCallView(Vertical):
-    """One Tool Call in the Transcript: running indicator, then a short preview."""
+class ToolHeading(Horizontal, can_focus=True):
+    """A whole-row detail toggle with the same mouse and keyboard behavior."""
 
-    def __init__(self, name: str, summary: str) -> None:
+    BINDINGS = [Binding("enter", "toggle_tool_details", "Show / hide tool details", show=False)]
+
+    class Toggle(Message):
+        pass
+
+    def on_click(self, event: Click) -> None:
+        event.stop()
+        self.focus()
+        self.action_toggle_tool_details()
+
+    def action_toggle_tool_details(self) -> None:
+        self.post_message(self.Toggle())
+
+
+class ToolCallView(Vertical):
+    """Keep a Tool Call's real arguments, bounded result, and display state together."""
+
+    def __init__(self, name: str, arguments: str) -> None:
         super().__init__(name=name, classes="tool-call")
-        self._name = name
-        self._summary = summary
+        self._tool_name = name
+        self._arguments = arguments
         self._timer: Timer | None = None
         self._bright = True
         self._finished = False
+        self._expanded = False
 
     def compose(self) -> ComposeResult:
-        with Horizontal(classes="tool-heading"):
+        with ToolHeading(classes="tool-heading"):
             yield Static("●", classes="tool-dot running", markup=False)
-            yield Static(f"{self._name} {self._summary}", classes="tool-header", markup=False)
-            yield Static("running", classes="tool-status", markup=False)
-        yield Static("", classes="tool-preview", markup=False)
+            yield Static(_tool_title(self._tool_name, self._arguments), classes="tool-header", markup=False)
+            yield Static("Running", classes="tool-status", markup=False)
+            yield Static("▸", classes="tool-arrow", markup=False)
+        yield Static("└ Running", classes="tool-preview", markup=False)
+        with Vertical(classes="tool-details"):
+            yield Static(f"Tool: {self._tool_name}\nStatus: Running", classes="tool-metadata", markup=False)
+            yield Static("Arguments (raw JSON):", markup=False)
+            yield Static(self._arguments, classes="tool-arguments", markup=False)
+            yield Static("Tool Result (bounded):", markup=False)
+            yield Static("", classes="tool-output", markup=False)
+            yield Static("", classes="tool-result-details", markup=False)
+            yield Static("", classes="tool-log", markup=False)
 
     def on_mount(self) -> None:
         if not self._finished:
@@ -79,13 +110,12 @@ class ToolCallView(Vertical):
         self._bright = not self._bright
         self.query_one(".tool-dot", Static).styles.text_opacity = 1.0 if self._bright else 0.3
 
-    def on_collapsible_expanded(self, event: Collapsible.Expanded) -> None:
-        self.query_one(".tool-preview", Static).display = False
+    def on_tool_heading_toggle(self, event: ToolHeading.Toggle) -> None:
         event.stop()
-
-    def on_collapsible_collapsed(self, event: Collapsible.Collapsed) -> None:
-        self.query_one(".tool-preview", Static).display = True
-        event.stop()
+        self._expanded = not self._expanded
+        self.query_one(".tool-details").display = self._expanded
+        self.query_one(".tool-preview", Static).display = not self._expanded
+        self.query_one(".tool-arrow", Static).update("▾" if self._expanded else "▸")
 
     def finish(self, result: ToolResult, duration_seconds: float | None) -> None:
         if self._finished:
@@ -99,29 +129,86 @@ class ToolCallView(Vertical):
         if result.status == "error":
             dot.add_class("error")
         dot.styles.text_opacity = 1.0
-        self.query_one(".tool-status", Static).update(_tool_status_text(result, duration_seconds))
-        lines = result.output.split("\n")
-        if lines[-1:] == [""]:
-            lines = lines[:-1]
-        shown = lines[-5:] if self._name == "run_command" else lines[:5]
-        self.query_one(".tool-preview", Static).update("\n".join(shown))
+        status = _TOOL_STATUS_LABELS[result.status]
+        self.query_one(".tool-header", Static).update(_tool_title(self._tool_name, self._arguments, result))
+        self.query_one(".tool-status", Static).update(status)
+        self.set_class(result.status == "error", "failed")
+        self.query_one(".tool-preview", Static).update(f"└ {_tool_summary(self._tool_name, result)}")
+        metadata = f"Tool: {self._tool_name}\nStatus: {status} ({result.status})"
+        if result.error_code is not None:
+            metadata += f"\nError code: {result.error_code}"
+        if duration_seconds is not None:
+            metadata += f"\nDuration: {duration_seconds:.2f}s"
+        self.query_one(".tool-metadata", Static).update(metadata)
+        self.query_one(".tool-output", Static).update(result.output)
+        details = self.query_one(".tool-result-details", Static)
+        details.update(json.dumps(result.details, ensure_ascii=False, indent=2) if result.details else "")
+        details.display = bool(result.details)
         log_path = result.details.get("log_path")
+        log = self.query_one(".tool-log", Static)
+        log.display = isinstance(log_path, str) and bool(log_path)
         if isinstance(log_path, str) and log_path:
-            self.mount(Static(log_path, classes="tool-log", markup=False))
-        if len(lines) > 5:
-            self.mount(Collapsible(
-                Static(result.output, classes="tool-output", markup=False),
-                title=f"Show all {len(lines)} lines", collapsed=True,
-                collapsed_symbol="+", expanded_symbol="-",
-            ))
+            log.update(log_path)
 
     def cancel(self) -> None:
         self.finish(ToolResult("cancelled", "Cancelled by the user before the tool call finished."), None)
 
 
-def _tool_status_text(result: ToolResult, duration_seconds: float | None) -> str:
-    label = f"error ({result.error_code})" if result.status == "error" else result.status
-    return label if duration_seconds is None else f"{label} · {duration_seconds:.2f}s"
+def _tool_title(name: str, arguments: str, result: ToolResult | None = None) -> str:
+    action = {
+        "read_file": "Read", "write_file": "Write", "edit_file": "Edit",
+        "find_files": "Find", "search_content": "Search", "run_command": "Run",
+    }.get(name, name)
+    try:
+        values = json.loads(arguments)
+    except json.JSONDecodeError:
+        return action
+    if not isinstance(values, dict):
+        return action
+    key = "command" if name == "run_command" else "pattern" if name in {"find_files", "search_content"} else "path"
+    target = values.get(key)
+    title = f"{action} {target}" if isinstance(target, str) else action
+    scope_key = "cwd" if name == "run_command" else "path"
+    scope = values.get(scope_key)
+    if not isinstance(scope, str) and result is not None:
+        scope = result.details.get(scope_key)
+    if key != "path" and isinstance(scope, str):
+        title += f" in {scope}"
+    return " ".join(title.split())
+
+
+def _tool_summary(name: str, result: ToolResult) -> str:
+    fallback = f"Failed ({result.error_code})" if result.status == "error" else _TOOL_STATUS_LABELS[result.status]
+    summary = next((line.strip() for line in result.output.splitlines() if line.strip()), fallback)
+    details = result.details
+    if result.status == "success":
+        if name == "read_file":
+            start, end = details.get("start_line"), details.get("end_line")
+            if type(start) is int and type(end) is int:
+                summary = f"Lines {start}–{end}"
+        elif name == "write_file" and type(details.get("bytes")) is int:
+            summary = f"Wrote {details['bytes']} bytes"
+        elif name == "edit_file" and type(details.get("edits")) is int:
+            noun = "operation" if details["edits"] == 1 else "operations"
+            summary = f"Applied {details['edits']} replacement {noun}"
+        elif name == "find_files":
+            total, count = details.get("total"), details.get("count")
+            if type(total) is int:
+                summary = f"Found {total} files"
+                if type(count) is int:
+                    summary += f" · Returned {count}"
+            elif type(count) is int:
+                summary = f"Returned {count} files"
+        elif name == "search_content" and type(details.get("count")) is int:
+            noun = "line" if details["count"] == 1 else "lines"
+            summary = f"Returned {details['count']} matching {noun}"
+        elif name == "run_command" and type(details.get("exit_code")) is int:
+            summary = f"Exited with code {details['exit_code']}"
+    truncated = (
+        bool(details.get("truncated_by")) or result.error_code == "output_limit_exceeded"
+        or (name == "search_content" and any(line.endswith("... [line truncated]") for line in result.output.splitlines()))
+    )
+    return f"Truncated · {summary}" if truncated else summary
 
 
 async def _show_after_cancel(
@@ -186,12 +273,19 @@ class RepluxApp(App[None]):
     .thinking-content { color: $text-muted; }
     .turn-status { margin-top: 1; color: $warning; }
     .tool-call { height: auto; margin-top: 1; }
-    .tool-heading { height: 1; }
+    .tool-heading { height: 1; pointer: pointer; }
+    .tool-heading:hover { background: $boost; }
+    .tool-heading:focus { background: $boost; text-style: bold; }
+    .tool-heading:focus .tool-arrow { color: $accent; }
     .tool-dot { width: 2; color: $text-muted; }
     .tool-dot.error { color: $error; }
-    .tool-header { width: auto; margin-right: 1; }
-    .tool-status { width: 1fr; color: $text-muted; text-wrap: nowrap; text-overflow: ellipsis; }
-    .tool-preview, .tool-output, .tool-log { color: $text-muted; }
+    .tool-header { width: 1fr; margin-right: 1; text-wrap: nowrap; text-overflow: ellipsis; }
+    .tool-status { width: auto; color: $text-muted; }
+    .tool-arrow { width: 2; margin-left: 1; color: $text-muted; }
+    .tool-preview { height: 1; margin-left: 2; text-wrap: nowrap; text-overflow: ellipsis; }
+    .tool-preview, .tool-details { color: $text-muted; }
+    .tool-details { display: none; height: auto; margin-left: 2; }
+    .tool-call.failed .tool-status, .tool-call.failed .tool-preview { color: $error; }
     .tool-log { height: auto; }
     """
 
@@ -311,7 +405,7 @@ class RepluxApp(App[None]):
                 else:
                     thinking.update(thinking_text)
             elif isinstance(event, ToolStarted):
-                view = ToolCallView(event.name, event.summary)
+                view = ToolCallView(event.name, event.arguments)
                 tools[event.call_id] = view
                 await transcript.mount(view)
                 self.query_one("#status", Static).update(f"Running {event.name}...")
@@ -320,7 +414,7 @@ class RepluxApp(App[None]):
             elif isinstance(event, ToolFinished):
                 finished = tools.get(event.call_id)
                 if finished is None:
-                    finished = ToolCallView(event.name, event.summary)
+                    finished = ToolCallView(event.name, event.arguments)
                     tools[event.call_id] = finished
                     await transcript.mount(finished)
                 finished.finish(event.result, event.duration_seconds)

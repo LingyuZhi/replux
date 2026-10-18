@@ -9,7 +9,7 @@ import time
 from typing import Any
 
 import pytest
-from textual.widgets import Collapsible, Static, TextArea
+from textual.widgets import Static, TextArea
 from textual.worker import WorkerCancelled
 
 from replux.cli import create_app
@@ -545,7 +545,7 @@ async def test_cancelling_a_search_skips_the_rest_of_the_batch(
 
 
 @pytest.mark.parametrize("protocol", ["anthropic", "openai"])
-async def test_the_ui_previews_the_head_and_expand_matches_the_model_result(
+async def test_the_ui_summarizes_counts_and_expand_matches_the_model_result(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str,
 ) -> None:
     for name in ("a.txt", "b.txt", "c.txt", "d.txt", "e.txt", "f.txt", ".hidden.txt"):
@@ -566,15 +566,14 @@ async def test_the_ui_previews_the_head_and_expand_matches_the_model_result(
         await asyncio.wait_for(summary.blocked.wait(), timeout=2)
         await pilot.pause()
         view = app.query_one(".tool-call")
-        assert view.query_one(".tool-header", Static).content == "find_files pattern=*.txt include_hidden=true"
-        assert str(view.query_one(".tool-status", Static).content).startswith("success · ")
+        assert view.query_one(".tool-header", Static).content == f"Find *.txt in {tmp_path}"
+        assert view.query_one(".tool-status", Static).content == "Success"
         preview = str(view.query_one(".tool-preview", Static).content)
-        assert preview == "\n".join((".hidden.txt", "a.txt", "b.txt", "c.txt", "d.txt"))
-        assert "e.txt" not in preview.split("\n")
+        assert preview == "└ Found 7 files · Returned 7"
         assert app.query_one("#status", Static).content == "Generating..."
         assert "Confirm" not in str(app.query_one("#status", Static).content)
-        output = view.query_one(Collapsible)
-        await pilot.click(output.query_one("CollapsibleTitle", Static), offset=(1, 0))
+        output = view.query_one(".tool-details")
+        await pilot.click(view.query_one(".tool-heading"))
         expanded = str(output.query_one(".tool-output", Static).content)
         assert ".secret.txt" not in expanded
         assert "secret.log" not in expanded
@@ -632,7 +631,7 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         assert not later.exists()
         assert app.query_one("#status", Static).content == "Ready"
         shown = [status.split(" · ", 1)[0] for status in statuses(app)]
-        assert shown == ["cancelled", "skipped"]
+        assert shown == ["Cancelled", "Skipped"]
         prompt.text = "follow-up"
         await pilot.press("enter")
         await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)

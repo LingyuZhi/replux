@@ -21,10 +21,10 @@ async def test_tool_first_turn_has_no_empty_reply_or_spacing_before_the_tool() -
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
             yield TextDelta("")
             yield TextDelta(" \n")
-            yield ToolStarted("read", "read_file", "path=notes.txt")
+            yield ToolStarted("read", "read_file", "path=notes.txt", '{"path": "notes.txt"}')
             self.started.set()
             await self.release.wait()
-            yield ToolFinished("read", "read_file", "path=notes.txt", ToolResult("success", "1\talpha"), 0.1)
+            yield ToolFinished("read", "read_file", "path=notes.txt", ToolResult("success", "1\talpha"), 0.1, '{"path": "notes.txt"}')
             yield TextDelta("[bold]Plain reply[/bold]\n  continued")
             yield ReplyCompleted("end_turn", None, None)
 
@@ -64,7 +64,7 @@ async def test_late_thinking_follows_its_input_even_when_reply_and_tools_are_alr
 
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
             yield TextDelta("Before the tool")
-            yield ToolFinished("read", "read_file", "path=notes.txt", ToolResult("skipped", "Not run."), None)
+            yield ToolFinished("read", "read_file", "path=notes.txt", ToolResult("skipped", "Not run."), None, '{"path": "notes.txt"}')
             yield ThinkingDelta(" \n")
             self.ready.set()
             await self.release.wait()
@@ -272,8 +272,8 @@ async def test_multiline_input_background_markers_and_body_columns_at_agreed_siz
     class ScriptedClient(LLMClient):
         async def stream_reply(self, user_input: str) -> AsyncGenerator[StreamEvent, None]:
             yield ThinkingDelta("Visible reasoning")
-            yield ToolStarted("read", "read_file", "path=notes.txt")
-            yield ToolFinished("read", "read_file", "path=notes.txt", ToolResult("success", "1\talpha"), 0.1)
+            yield ToolStarted("read", "read_file", "path=notes.txt", '{"path": "notes.txt"}')
+            yield ToolFinished("read", "read_file", "path=notes.txt", ToolResult("success", "1\talpha"), 0.1, '{"path": "notes.txt"}')
             yield TextDelta(reply_text)
             yield ReplyCompleted("end_turn", None, None)
 
