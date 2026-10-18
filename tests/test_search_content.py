@@ -671,7 +671,7 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         await pilot.press("enter")
         await wait_for_tick(marker)
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Search alpha…"
+        assert app.query_one("#status", Static).content == "Searching… alpha"
         assert process_state(int(child.read_text())) == "running"
         worker = next(iter(app.workers))
         await pilot.press("ctrl+c")

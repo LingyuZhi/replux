@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import time
 from typing import Any
@@ -386,7 +387,10 @@ def install_slow_ripgrep(directory: Path) -> tuple[Path, Path, Path, Path]:
     ripgrep.write_text(
         f"#!{sys.executable}\n"
         "import os\n"
+        "import sys\n"
         "import time\n"
+        "if '--warmup' in sys.argv:\n"
+        "    raise SystemExit(0)\n"
         "open(os.environ['LEADER'], 'w').write(str(os.getpid()))\n"
         "pid = os.fork()\n"
         "if pid == 0:\n"
@@ -396,6 +400,8 @@ def install_slow_ripgrep(directory: Path) -> tuple[Path, Path, Path, Path]:
         encoding="utf-8",
     )
     ripgrep.chmod(0o755)
+    # Warm the executable before a test starts its short process-cleanup clock.
+    subprocess.run([str(ripgrep), "--warmup"], check=True, timeout=10)
     return ripgrep, leader, child, marker
 
 
@@ -611,7 +617,7 @@ async def test_the_ui_stays_cancelling_until_the_search_process_group_is_reaped(
         await pilot.press("enter")
         await wait_for_tick(marker)
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Find *.txt…"
+        assert app.query_one("#status", Static).content == "Finding… *.txt"
         assert process_state(int(child.read_text())) == "running"
         worker = next(iter(app.workers))
         await pilot.press("ctrl+c")

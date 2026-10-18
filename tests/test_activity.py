@@ -70,7 +70,7 @@ async def test_activity_tracks_real_phases_and_total_local_time_until_cleanup_fi
             assert not app.query(".thinking, .turn-outcome")
 
             for index, (action, elapsed) in enumerate([
-                ("Thinking…", "2.0s"), ("Read notes.txt…", "4.0s"),
+                ("Thinking…", "2.0s"), ("Reading… notes.txt", "4.0s"),
                 ("Working…", "6.0s"), ("Writing reply…", "8.0s"),
                 ("Writing reply…", "10.0s"),
             ], start=1):
@@ -337,12 +337,12 @@ async def test_six_tool_actions_use_raw_arguments_and_leave_time_and_cancel_hint
     pattern = "long-pattern|" * 30 + "TODO"
     command = "printf 'long command' " * 30 + "\n  printf done"
     cases: list[tuple[str, dict[str, object], str]] = [
-        ("read_file", {"path": target}, f"Read {target}…"),
-        ("write_file", {"path": target, "content": "new bytes"}, f"Write {target}…"),
-        ("edit_file", {"path": target, "edits": []}, f"Edit {target}…"),
-        ("find_files", {"pattern": pattern, "path": "src"}, f"Find {pattern} in src…"),
-        ("search_content", {"pattern": pattern, "path": "src"}, f"Search {pattern} in src…"),
-        ("run_command", {"command": command, "cwd": "/work"}, "Run " + "printf 'long command' " * 30 + "printf done in /work…"),
+        ("read_file", {"path": target}, f"Reading… {target}"),
+        ("write_file", {"path": target, "content": "new bytes"}, f"Writing… {target}"),
+        ("edit_file", {"path": target, "edits": []}, f"Editing… {target}"),
+        ("find_files", {"pattern": pattern, "path": "src"}, f"Finding… {pattern} in src"),
+        ("search_content", {"pattern": pattern, "path": "src"}, f"Searching… {pattern} in src"),
+        ("run_command", {"command": command, "cwd": "/work"}, "Running… " + "printf 'long command' " * 30 + "printf done in /work"),
     ]
 
     class ScriptedClient(LLMClient):
@@ -369,6 +369,7 @@ async def test_six_tool_actions_use_raw_arguments_and_leave_time_and_cancel_hint
             prompt = app.query_one("#prompt", TextArea)
             prompt.text = "use tools"
             await pilot.press("enter")
+            prompt.text = "Draft line\n" * 10
             for index, (_, _, expected) in enumerate(cases):
                 await asyncio.wait_for(client.reached[index].wait(), timeout=2)
                 await pilot.pause()

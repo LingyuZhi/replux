@@ -5,6 +5,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing
 from importlib.metadata import version
 import json
+from math import cos, tau
 from pathlib import Path
 from time import monotonic
 
@@ -12,6 +13,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.events import Click, Key
 from textual.message import Message
 from textual.timer import Timer
@@ -36,6 +38,11 @@ SPARK_LOGO = "\n".join((
 ))
 
 _TOOL_STATUS_LABELS = {"success": "Success", "error": "Failed", "cancelled": "Cancelled", "skipped": "Skipped"}
+_TOOL_ACTIONS = {
+    "read_file": ("Read", "Reading…"), "write_file": ("Write", "Writing…"),
+    "edit_file": ("Edit", "Editing…"), "find_files": ("Find", "Finding…"),
+    "search_content": ("Search", "Searching…"), "run_command": ("Run", "Running…"),
+}
 
 
 class UserMessage(Horizontal):
@@ -79,16 +86,20 @@ class ToolHeading(Horizontal, can_focus=True):
 class ToolCallView(Vertical):
     """Keep a Tool Call's real arguments, bounded result, and display state together."""
 
-    def __init__(self, name: str, arguments: str) -> None:
+    COMPONENT_CLASSES = {"tool-call--action"}
+
+    def __init__(self, name: str, arguments: str, *, running: bool = True) -> None:
         super().__init__(name=name, classes="tool-call")
         self._tool_name = name
         self._arguments = arguments
         self._finished = False
         self._expanded = False
+        self._started_at = monotonic() if running else None
+        self._pulse_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with ToolHeading(classes="tool-heading"):
-            yield Static("●", classes="tool-dot running", markup=False)
+            yield Static("●", classes="tool-dot running" if self._started_at is not None else "tool-dot", markup=False)
             yield Static(_tool_title(self._tool_name, self._arguments), classes="tool-header", markup=False)
             yield Static("Running", classes="tool-status", markup=False)
             yield Static("▸", classes="tool-arrow", markup=False)
@@ -102,6 +113,24 @@ class ToolCallView(Vertical):
             yield Static("", classes="tool-result-details", markup=False)
             yield Static("", classes="tool-log", markup=False)
 
+    def on_mount(self) -> None:
+        self._update_title()
+        if self._started_at is not None:
+            self._started_at = monotonic()
+            self._pulse_timer = self.set_interval(0.1, self._breathe)
+
+    def _breathe(self) -> None:
+        if self._started_at is not None:
+            elapsed = monotonic() - self._started_at
+            self.query_one(".tool-dot", Static).styles.text_opacity = 0.55 + 0.45 * (1 + cos(tau * elapsed / 3)) / 2
+
+    def _update_title(self, result: ToolResult | None = None) -> None:
+        title = _tool_title(self._tool_name, self._arguments, result)
+        action_color = self.get_component_styles("tool-call--action").color.hex
+        self.query_one(".tool-header", Static).update(
+            Content(title).stylize(action_color, end=len(title.split(" ", 1)[0])),
+        )
+
     def on_tool_heading_toggle(self, event: ToolHeading.Toggle) -> None:
         event.stop()
         self._expanded = not self._expanded
@@ -113,14 +142,19 @@ class ToolCallView(Vertical):
         if self._finished:
             return
         self._finished = True
+        self._started_at = None
+        if self._pulse_timer is not None:
+            self._pulse_timer.stop()
+            self._pulse_timer = None
         dot = self.query_one(".tool-dot", Static)
+        dot.styles.text_opacity = 1.0
         dot.remove_class("running")
         if result.status == "error":
             dot.add_class("error")
         status = _TOOL_STATUS_LABELS[result.status]
-        self.query_one(".tool-header", Static).update(_tool_title(self._tool_name, self._arguments, result))
-        self.query_one(".tool-status", Static).update(status)
         self.set_class(result.status == "error", "failed")
+        self._update_title(result)
+        self.query_one(".tool-status", Static).update(status)
         self.query_one(".tool-preview", Static).update(f"└ {_tool_summary(self._tool_name, result)}")
         metadata = f"Tool: {self._tool_name}\nStatus: {status} ({result.status})"
         if result.error_code is not None:
@@ -142,11 +176,8 @@ class ToolCallView(Vertical):
         self.finish(ToolResult("cancelled", "Cancelled by the user before the tool call finished."), None)
 
 
-def _tool_title(name: str, arguments: str, result: ToolResult | None = None) -> str:
-    action = {
-        "read_file": "Read", "write_file": "Write", "edit_file": "Edit",
-        "find_files": "Find", "search_content": "Search", "run_command": "Run",
-    }.get(name, name)
+def _tool_title(name: str, arguments: str, result: ToolResult | None = None, *, ongoing: bool = False) -> str:
+    action = _TOOL_ACTIONS.get(name, (name, f"{name}…"))[1 if ongoing else 0]
     try:
         values = json.loads(arguments)
     except json.JSONDecodeError:
@@ -325,7 +356,9 @@ class RepluxApp(App[None]):
     .tool-heading:hover { background: $boost; }
     .tool-heading:focus { background: $boost; text-style: bold; }
     .tool-heading:focus .tool-arrow { color: $accent; }
-    .tool-dot { width: 2; color: $text-muted; }
+    .tool-dot { width: 2; color: #d9a36f; }
+    .tool-call .tool-call--action { color: #d9a36f; }
+    .tool-call.failed .tool-call--action { color: $error; }
     .tool-dot.error { color: $error; }
     .tool-header { width: 1fr; margin-right: 1; text-wrap: nowrap; text-overflow: ellipsis; }
     .tool-status { width: auto; color: $text-muted; }
@@ -481,13 +514,13 @@ class RepluxApp(App[None]):
                 view = ToolCallView(event.name, event.arguments)
                 tools[event.call_id] = view
                 await transcript.mount(view)
-                self._show_activity(f"{_tool_title(event.name, event.arguments)}…")
+                self._show_activity(_tool_title(event.name, event.arguments, ongoing=True))
                 reply = None
                 text = ""
             elif isinstance(event, ToolFinished):
                 finished = tools.get(event.call_id)
                 if finished is None:
-                    finished = ToolCallView(event.name, event.arguments)
+                    finished = ToolCallView(event.name, event.arguments, running=False)
                     tools[event.call_id] = finished
                     await transcript.mount(finished)
                 finished.finish(event.result, event.duration_seconds)

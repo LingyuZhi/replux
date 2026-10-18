@@ -682,7 +682,7 @@ async def test_the_ui_stays_cancelling_until_an_in_progress_commit_finishes(
         await pilot.press("enter")
         assert await asyncio.to_thread(hold.entered.wait, 2)
         await pilot.pause()
-        assert app.query_one("#status", Static).content == "Write a.txt…"
+        assert app.query_one("#status", Static).content == "Writing… a.txt"
         assert target.read_bytes() == b"old"
         worker = next(iter(app.workers))
         await pilot.press("ctrl+c")

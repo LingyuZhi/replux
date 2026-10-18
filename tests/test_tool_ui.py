@@ -27,7 +27,7 @@ def visible_text(app: RepluxApp) -> str:
     return unescape(app.export_screenshot()).replace("\xa0", " ")
 
 
-async def test_running_tool_stays_static_while_bottom_activity_animates() -> None:
+async def test_running_tool_keeps_details_and_draft_while_bottom_activity_animates() -> None:
     class ScriptedClient(LLMClient):
         def __init__(self) -> None:
             self.inputs: list[str] = []
@@ -63,12 +63,11 @@ async def test_running_tool_stays_static_while_bottom_activity_animates() -> Non
         assert dot.has_class("running")
         assert view.query_one(".tool-header", Static).content == "Read notes.txt"
         assert view.query_one(".tool-status", Static).content == "Running"
-        assert app.query_one("#status", Static).content == "Read notes.txt…"
+        assert app.query_one("#status", Static).content == "Reading… notes.txt"
         activity = app.query_one("#activity-dot", Static)
         first_frame = activity.content
         await pilot.pause(0.6)
         assert activity.content != first_frame
-        assert dot.styles.text_opacity == 1.0
         await pilot.press(*"草稿", "enter")
         assert client.inputs == ["读一下 notes.txt"]
         assert prompt.text == "草稿"
@@ -438,7 +437,7 @@ async def test_tool_cleanup_blocks_submit_then_shows_cancelled_and_skipped(
         await asyncio.wait_for(tool.entered.wait(), timeout=2)
         await pilot.pause()
         assert statuses(app) == ["Running"]
-        assert app.query_one("#status", Static).content == "Read ok.txt…"
+        assert app.query_one("#status", Static).content == "Reading… ok.txt"
         if protocol == "anthropic":
             assert "先看文件" in str(app.query_one(".thinking-content", Static).content)
         prompt.text = "草稿"
@@ -533,7 +532,7 @@ async def test_an_internal_tool_error_terminates_the_chat_after_cleanup(protocol
             await pilot.press("enter")
             await asyncio.wait_for(tool.entered.wait(), timeout=2)
             await pilot.pause()
-            assert app.query_one("#status", Static).content == "Read ok.txt…"
+            assert app.query_one("#status", Static).content == "Reading… ok.txt"
             tool.release.set()
             await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
     assert app.return_code == 1
