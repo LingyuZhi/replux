@@ -5,7 +5,8 @@ from typing import Any
 import pytest
 import httpx2 as httpx
 
-from replux.llm import IncompleteReplyError, LLMError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta, create_client
+from replux.agent import create_agent
+from replux.llm import IncompleteReplyError, LLMError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta
 from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events, thinking_events, unfinished_events
 
 
@@ -15,7 +16,8 @@ async def test_next_request_replays_each_completed_turn(protocol: str, refusal: 
     streams = [ControlledSSE(reply_events(protocol, refusal=refusal)) for _ in range(3)]
     transport = RecordingTransport(streams)
     expected: list[dict[str, Any]] = []
-    async with create_client(provider_config(protocol), transport=transport) as client:
+    async with create_agent(provider_config(protocol), transport=transport) as client:
+        assert client.mode == "work"
         for user_input in ["  第一问  ", "为什么？", "再说明一次"]:
             received = [event async for event in client.stream_reply(user_input)]
             expected.append({"role": "user", "content": user_input})
@@ -50,7 +52,7 @@ async def test_turn_commit_requires_final_success_and_finished_cleanup(
         ControlledSSE(reply_events(protocol)), pending, ControlledSSE(reply_events(protocol)),
     ])
     received: list[StreamEvent] = []
-    async with create_client(provider_config(protocol), transport=transport) as client:
+    async with create_agent(provider_config(protocol), transport=transport) as client:
         _ = [event async for event in client.stream_reply("first")]
 
         async def consume() -> None:
@@ -95,7 +97,7 @@ async def test_abandoned_reply_closes_stream_and_stays_out_of_next_request(proto
     events = reply_events(protocol)
     abandoned = ControlledSSE(events, gate_after=len(events) - 2)
     transport = RecordingTransport([ControlledSSE(reply_events(protocol)), abandoned, ControlledSSE(reply_events(protocol))])
-    async with create_client(provider_config(protocol), transport=transport) as client:
+    async with create_agent(provider_config(protocol), transport=transport) as client:
         _ = [event async for event in client.stream_reply("first")]
         reply = client.stream_reply("abandoned")
         assert await anext(reply) == TextDelta("你好")
@@ -123,7 +125,7 @@ async def test_unfinished_turn_preserves_previously_completed_history(protocol: 
         ControlledSSE(reply_events(protocol)),
     ]
     transport = RecordingTransport(streams)
-    async with create_client(provider_config(protocol), transport=transport) as client:
+    async with create_agent(provider_config(protocol), transport=transport) as client:
         _ = [event async for event in client.stream_reply("first")]
         received: list[StreamEvent] = []
         with pytest.raises(IncompleteReplyError) as caught:
@@ -156,7 +158,7 @@ async def test_anthropic_replays_native_thinking_signature_redacted_and_citation
     events.insert(-3, {"type": "content_block_delta", "index": 2, "delta": {"type": "citations_delta", "citation": citation}})
     streams = [ControlledSSE(events), ControlledSSE()]
     transport = RecordingTransport(streams)
-    async with create_client(provider_config(), transport=transport) as client:
+    async with create_agent(provider_config(), transport=transport) as client:
         received = [event async for event in client.stream_reply("first")]
         assert received == [
             ThinkingDelta("先分析\n"), ThinkingDelta("再回答"),

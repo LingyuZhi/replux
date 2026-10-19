@@ -8,7 +8,8 @@ import openai
 import pytest
 from textual.widgets import Static, TextArea
 
-from replux.llm import AuthenticationError, LLMError, NetworkError, RateLimitError, StreamEvent, TextDelta, create_client
+from replux.agent import create_agent
+from replux.llm import AuthenticationError, LLMError, NetworkError, RateLimitError, StreamEvent, TextDelta
 from replux.tui import RepluxApp
 from tests.support import ControlledSSE, RecordingTransport, native_reply, provider_config, reply_events
 from tests.tui_support import screen_lines, screen_text
@@ -43,7 +44,7 @@ async def test_stream_error_codes_keep_their_category_and_actual_http_status(
     failed = ControlledSSE(partial)
     transport = RecordingTransport([failed, ControlledSSE(reply_events(protocol))])
     received: list[StreamEvent] = []
-    async with create_client(config, transport=transport) as client:
+    async with create_agent(config, transport=transport) as client:
         with pytest.raises(error_type) as caught:
             async for event in client.stream_reply("failed"):
                 received.append(event)
@@ -99,7 +100,7 @@ async def test_request_errors_keep_cause_and_status_without_retry_or_history_cha
         streams.append(stream)
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
 
-    async with create_client(config, transport=httpx.MockTransport(respond)) as client:
+    async with create_agent(config, transport=httpx.MockTransport(respond)) as client:
         _ = [event async for event in client.stream_reply("first")]
         with pytest.raises(error_type, match=hint) as caught:
             _ = [event async for event in client.stream_reply("failed")]
@@ -140,7 +141,7 @@ async def test_cancel_closes_stream_and_discards_late_events_and_unfinished_turn
     streams = [ControlledSSE(reply_events(protocol)), pending, ControlledSSE(reply_events(protocol))]
     transport = RecordingTransport(streams)
     received: list[StreamEvent] = []
-    async with create_client(provider_config(protocol), transport=transport) as client:
+    async with create_agent(provider_config(protocol), transport=transport) as client:
         _ = [event async for event in client.stream_reply("first")]
 
         async def consume() -> None:
@@ -206,7 +207,7 @@ async def test_partial_failure_keeps_visible_text_and_draft_then_uses_only_compl
     )
     streams = [ControlledSSE(reply_events(protocol)), pending, ControlledSSE(reply_events(protocol))]
     transport = RecordingTransport(streams)
-    app = RepluxApp(create_client(config, transport=transport), model=config.model)
+    app = RepluxApp(create_agent(config, transport=transport), model=config.model)
     async with app.run_test() as pilot:
         prompt = app.query_one("#prompt", TextArea)
         prompt.text = "first"
@@ -271,7 +272,7 @@ async def test_cancel_during_stream_cleanup_waits_before_releasing_client(protoc
     pending.release_close.clear()
     transport = RecordingTransport([pending, ControlledSSE(reply_events(protocol))])
     received: list[StreamEvent] = []
-    async with create_client(provider_config(protocol), transport=transport) as client:
+    async with create_agent(provider_config(protocol), transport=transport) as client:
         async def consume() -> None:
             async for event in client.stream_reply("cancelled during cleanup"):
                 received.append(event)

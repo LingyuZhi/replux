@@ -5,9 +5,10 @@ from typing import Any
 
 import pytest
 
+from replux.agent import Agent, create_agent
 from replux.llm import (
-    AnthropicAdapter, Conversation, IncompleteReplyError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta,
-    ToolBatchLimitError, ToolFinished, ToolStarted, create_client,
+    AnthropicAdapter, IncompleteReplyError, ReplyCompleted, StreamEvent, TextDelta, ThinkingDelta,
+    ToolBatchLimitError, ToolFinished, ToolStarted,
 )
 from replux.tools import Tool, ToolParams, ToolRegistry, ToolResult, create_default_registry
 from tests.support import (
@@ -66,7 +67,7 @@ async def test_anthropic_reads_a_real_file_and_summarizes_with_tools_disabled(
     monkeypatch.chdir(tmp_path)
     streams = [ControlledSSE(tool_use_events()), ControlledSSE(reply_events()), ControlledSSE(reply_events())]
     transport = RecordingTransport(streams)
-    async with create_client(provider_config(), transport=transport) as client:
+    async with create_agent(provider_config(), transport=transport) as client:
         monkeypatch.chdir(tmp_path.parent)
         received = [event async for event in client.stream_reply("读一下 notes.txt")]
         _ = [event async for event in client.stream_reply("follow-up")]
@@ -116,7 +117,7 @@ async def test_responses_reads_real_files_and_pairs_results_by_call_id(
         ControlledSSE(reply_events("openai")),
     ]
     transport = RecordingTransport(streams)
-    async with create_client(provider_config("openai"), transport=transport) as client:
+    async with create_agent(provider_config("openai"), transport=transport) as client:
         monkeypatch.chdir(tmp_path.parent)
         received = [event async for event in client.stream_reply("读一下 notes.txt")]
         _ = [event async for event in client.stream_reply("follow-up")]
@@ -188,7 +189,7 @@ async def test_responses_tool_runs_only_after_the_response_completes_and_closes(
     pending.release_close.clear()
     transport = RecordingTransport([pending, ControlledSSE(reply_events("openai"))])
     received: list[StreamEvent] = []
-    async with create_client(provider_config("openai"), transport=transport) as client:
+    async with create_agent(provider_config("openai"), transport=transport) as client:
         async def consume() -> None:
             async for event in client.stream_reply("read it"):
                 received.append(event)
@@ -231,7 +232,7 @@ async def test_unfinished_responses_tool_call_executes_nothing_and_stays_out_of_
     unfinished = ControlledSSE(events)
     transport = RecordingTransport([unfinished, ControlledSSE(reply_events("openai"))])
     received: list[StreamEvent] = []
-    async with create_client(provider_config("openai"), transport=transport) as client:
+    async with create_agent(provider_config("openai"), transport=transport) as client:
         with pytest.raises(IncompleteReplyError):
             async for event in client.stream_reply("read it"):
                 received.append(event)
@@ -253,7 +254,7 @@ async def test_incomplete_responses_summary_is_not_committed_but_tool_results_ar
         ControlledSSE(function_call_events()), ControlledSSE(summary), ControlledSSE(reply_events("openai")),
     ])
     received: list[StreamEvent] = []
-    async with create_client(provider_config("openai"), transport=transport) as client:
+    async with create_agent(provider_config("openai"), transport=transport) as client:
         with pytest.raises(IncompleteReplyError):
             async for event in client.stream_reply("read it"):
                 received.append(event)
@@ -282,7 +283,7 @@ async def test_responses_invalid_arguments_use_the_shared_tool_error(
     monkeypatch.chdir(tmp_path)
     events = function_call_events((("fc_bad", "call_bad", "read_file", (arguments,)),))
     transport = RecordingTransport([ControlledSSE(events), ControlledSSE(reply_events("openai"))])
-    async with create_client(provider_config("openai"), transport=transport) as client:
+    async with create_agent(provider_config("openai"), transport=transport) as client:
         received = [event async for event in client.stream_reply("read it")]
     [finished] = [event for event in received if isinstance(event, ToolFinished)]
     assert (finished.result.status, finished.result.error_code) == ("error", "invalid_arguments")
@@ -305,7 +306,7 @@ async def test_tool_errors_are_returned_to_the_model_and_the_turn_completes(
         "invalid_arguments": ("read_file", '{"path": "absent.txt", "offset": "2"}', "invalid_arguments"),
     }[tool_call]
     transport = RecordingTransport([ControlledSSE(tool_use_events((arguments,), name=name)), ControlledSSE(reply_events())])
-    async with create_client(provider_config(), transport=transport) as client:
+    async with create_agent(provider_config(), transport=transport) as client:
         received = [event async for event in client.stream_reply("read it")]
     [finished] = [event for event in received if isinstance(event, ToolFinished)]
     assert (finished.result.status, finished.result.error_code) == ("error", code)
@@ -328,7 +329,7 @@ async def test_tool_runs_only_after_the_response_completes_and_closes(
     pending.release_close.clear()
     transport = RecordingTransport([pending, ControlledSSE(reply_events())])
     received: list[StreamEvent] = []
-    async with create_client(provider_config(), transport=transport) as client:
+    async with create_agent(provider_config(), transport=transport) as client:
         async def consume() -> None:
             async for event in client.stream_reply("read it"):
                 received.append(event)
@@ -365,7 +366,7 @@ async def test_unfinished_tool_response_executes_nothing_and_stays_out_of_contex
     unfinished = ControlledSSE(events)
     transport = RecordingTransport([unfinished, ControlledSSE(reply_events())])
     received: list[StreamEvent] = []
-    async with create_client(provider_config(), transport=transport) as client:
+    async with create_agent(provider_config(), transport=transport) as client:
         with pytest.raises(IncompleteReplyError):
             async for event in client.stream_reply("read it"):
                 received.append(event)
@@ -387,7 +388,7 @@ async def test_unpairable_tool_calls_execute_nothing(
         copies = [{**event, "index": 3} for event in events[start:-2]]
         events[-2:-2] = copies
     transport = RecordingTransport([ControlledSSE(events), ControlledSSE(reply_events())])
-    async with create_client(provider_config(), transport=transport) as client:
+    async with create_agent(provider_config(), transport=transport) as client:
         received: list[StreamEvent] = []
         with pytest.raises(IncompleteReplyError, match="IDs"):
             async for event in client.stream_reply("read it"):
@@ -422,7 +423,7 @@ async def test_ended_tool_batch_commits_its_real_results_without_a_summary(endin
     registry = ToolRegistry()
     registry.register(tool)
     transport = RecordingTransport([ControlledSSE(tool_use_events()), ControlledSSE(reply_events())])
-    async with Conversation(AnthropicAdapter(provider_config(), transport=transport), registry) as client:
+    async with Agent(AnthropicAdapter(provider_config(), transport=transport), registry) as client:
         reply = client.stream_reply("read it")
         while not isinstance(await anext(reply), ToolStarted):
             pass
@@ -459,7 +460,7 @@ async def test_tool_request_in_the_summary_stops_the_turn_and_keeps_earlier_resu
     monkeypatch.chdir(tmp_path)
     again = tool_use_events(call_id="toolu_again")
     transport = RecordingTransport([ControlledSSE(tool_use_events()), ControlledSSE(again), ControlledSSE(reply_events())])
-    async with create_client(provider_config(), transport=transport) as client:
+    async with create_agent(provider_config(), transport=transport) as client:
         received: list[StreamEvent] = []
         with pytest.raises(ToolBatchLimitError):
             async for event in client.stream_reply("read it"):

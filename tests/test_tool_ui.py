@@ -13,11 +13,15 @@ from replux.cli import create_app
 from replux.llm import LLMClient, ReplyCompleted, StreamEvent, TextDelta, ToolFinished, ToolStarted
 from replux.tools import ToolRegistry, ToolResult
 from replux.tui import RepluxApp, ToolCallView
-from tests.support import ControlledSSE, RecordingTransport, function_call_events, provider_config, reply_events, tool_use_events
+from tests.support import (
+    ControlledSSE, RecordingTransport, function_call_events, native_reply, native_tool_use,
+    provider_config, reply_events, tool_use_events,
+)
 from tests.test_config import VALID_YAML
 from tests.test_tool_batch import (
     BoomRead, GatedRead, batch_events, open_client, read_call, result_pairs, text_gate,
 )
+from tests.test_tool_turn import messages, responses_input
 
 
 EIGHT_LINES = "\n".join(f"{number}\tline {number}" for number in range(1, 9))
@@ -185,7 +189,8 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
     monkeypatch.chdir(tmp_path)
     tool_events = tool_use_events() if protocol == "anthropic" else function_call_events()
     summary = ControlledSSE(reply_events(protocol), gate_after=0)
-    transport = RecordingTransport([ControlledSSE(tool_events), summary])
+    streams = [ControlledSSE(tool_events), summary, ControlledSSE(reply_events(protocol))]
+    transport = RecordingTransport(streams)
     app = create_app(["--config", str(config)], transport=transport)
     async with app.run_test(size=(80, 40)) as pilot:
         app.query_one("#prompt", TextArea).text = "读一下 notes.txt"
@@ -207,11 +212,25 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         await pilot.pause()
         assert app.query_one("#status", Static).content == "Ready"
         assert len(app.query(".reply")) == 2
+        assert len(app.query(".user-message")) == 1
         assert "我先读文件。" in visible_text(app)
         assert "你好，世界" in visible_text(app)
-    assert len(transport.requests) == 2
+        if protocol == "anthropic":
+            assert app.query_one(".thinking-content", Static).content == "先看文件"
+        prompt = app.query_one("#prompt", TextArea)
+        prompt.text = "follow-up"
+        prompt.focus()
+        await pilot.press("enter")
+        await asyncio.wait_for(app.workers.wait_for_complete(), timeout=2)
+        await pilot.pause()
+        assert len(app.query(".user-message")) == 2
+        assert len(app.query(".reply")) == 3
+        assert len(app.query(ToolCallView)) == 1
+        assert app.query_one("#status", Static).content == "Ready"
+    assert len(transport.requests) == 3
+    assert all(stream.closed for stream in streams)
     assert transport.closed
-    first, summary_request = (json.loads(request.content) for request in transport.requests)
+    first, summary_request, follow_up = (json.loads(request.content) for request in transport.requests)
     endpoint = "v1/messages" if protocol == "anthropic" else "responses"
     assert str(transport.requests[0].url).endswith("/" + endpoint)
     assert str(transport.requests[1].url).endswith("/" + endpoint)
@@ -220,6 +239,11 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         assert first["tools"][0]["input_schema"]["properties"]["path"]["minLength"] == 1
         assert "tool_choice" not in first
         assert summary_request["tool_choice"] == {"type": "none"}
+        assert messages(transport.requests[1])[1] == native_tool_use({"path": "notes.txt"})
+        assert messages(transport.requests[2]) == [
+            *messages(transport.requests[1]), *native_reply(protocol), {"role": "user", "content": "follow-up"},
+        ]
+        call_id = "toolu_read"
     else:
         assert first["tools"][0]["type"] == "function"
         assert first["tools"][0]["parameters"]["properties"]["path"]["minLength"] == 1
@@ -227,6 +251,15 @@ async def test_assembled_app_reads_a_file_and_stays_busy_until_the_summary_compl
         assert "tool_choice" not in first
         assert summary_request["tool_choice"] == "none"
         assert summary_request["store"] is False
+        assert summary_request["input"][1:-1] == tool_events[-1]["response"]["output"]
+        assert responses_input(transport.requests[2]) == [
+            *responses_input(transport.requests[1]), *native_reply(protocol), {"role": "user", "content": "follow-up"},
+        ]
+        call_id = "call_notes"
+    assert result_pairs(protocol, transport.requests[2]) == [(call_id, json.loads(ToolResult(
+        "success", EIGHT_LINES, details={"path": str(tmp_path / "notes.txt"), "start_line": 1, "end_line": 8},
+    ).to_json()))]
+    assert "tool_choice" not in follow_up
 
 
 def provider_file(tmp_path: Path, protocol: str) -> Path:

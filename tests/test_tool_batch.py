@@ -10,10 +10,10 @@ from typing import Any
 import pytest
 import httpx2 as httpx
 
+from replux.agent import Agent, create_agent
 from replux.llm import (
-    AnthropicAdapter, Conversation, IncompleteReplyError, LLMClient, LLMError, ModelResponse, OpenAIAdapter,
+    AnthropicAdapter, IncompleteReplyError, LLMClient, LLMError, ModelResponse, OpenAIAdapter,
     ProtocolAdapter, ReplyCompleted, StreamEvent, TextDelta, ToolBatchLimitError, ToolFinished, ToolStarted,
-    create_client,
 )
 from replux.tools import Tool, ToolParams, ToolRegistry, ToolResult, create_default_registry, run_file_operation
 from replux.tools.read_file import ReadFileParams, ReadFileTool
@@ -128,7 +128,7 @@ def open_client(protocol: str, transport: httpx.AsyncBaseTransport, registry: To
         adapter = AnthropicAdapter(config, transport=transport)
     else:
         adapter = OpenAIAdapter(config, transport=transport)
-    return Conversation[Any](adapter, registry)
+    return Agent[Any](adapter, registry)
 
 
 def recording_client(
@@ -509,7 +509,7 @@ async def test_a_failed_summary_keeps_tool_results_and_drops_the_summary_fragmen
         streams.append(stream)
         return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=stream)
 
-    async with create_client(provider_config(protocol), transport=httpx.MockTransport(respond)) as client:
+    async with create_agent(provider_config(protocol), transport=httpx.MockTransport(respond)) as client:
         monkeypatch.chdir(tmp_path.parent)
         received: list[StreamEvent] = []
 
@@ -633,7 +633,7 @@ async def test_the_next_turn_can_run_its_own_tool_batch(
         ControlledSSE(batch_events(protocol, (read_call("call_b", "b.txt"),))),
         ControlledSSE(reply_events(protocol)),
     ])
-    async with create_client(provider_config(protocol), transport=transport) as client:
+    async with create_agent(provider_config(protocol), transport=transport) as client:
         monkeypatch.chdir(tmp_path.parent)
         first = [event async for event in client.stream_reply("first")]
         second = [event async for event in client.stream_reply("second")]

@@ -1,4 +1,4 @@
-"""Full-screen text chat using the shared LLM interface."""
+"""Full-screen text chat displaying the Agent's Turn events."""
 
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -20,8 +20,9 @@ from textual.timer import Timer
 from textual.worker import WorkerCancelled
 from textual.widgets import Collapsible, Static, TextArea
 
+from replux.agent import AgentEvent
 from replux.llm import (
-    IncompleteReplyError, LLMClient, LLMError, StreamEvent, TextDelta, ThinkingDelta,
+    IncompleteReplyError, LLMClient, LLMError, TextDelta, ThinkingDelta,
     ToolBatchLimitError, ToolFinished, ToolStarted,
 )
 from replux.tools import ToolResult
@@ -235,7 +236,7 @@ def _tool_summary(name: str, result: ToolResult) -> str:
 
 
 async def _show_after_cancel(
-    events: AsyncGenerator[StreamEvent, None], show: Callable[[StreamEvent], Awaitable[None]],
+    events: AsyncGenerator[AgentEvent, None], show: Callable[[AgentEvent], Awaitable[None]],
 ) -> None:
     """Ask a paused reply to publish terminal tool events, then render them."""
     try:
@@ -386,9 +387,9 @@ class RepluxApp(App[None]):
     .tool-log { height: auto; }
     """
 
-    def __init__(self, client: LLMClient, *, model: str) -> None:
+    def __init__(self, agent: LLMClient, *, model: str) -> None:
         super().__init__()
-        self._client = client
+        self._agent = agent
         self._model = model
         self._generating = False
         self._cancelling = False
@@ -479,7 +480,7 @@ class RepluxApp(App[None]):
         thinking_control: Collapsible | None = None
         tools: dict[str, ToolCallView] = {}
 
-        async def show(event: StreamEvent) -> None:
+        async def show(event: AgentEvent) -> None:
             if isinstance(event, TextDelta):
                 # Finish displaying the returned delta before forwarding cancellation.
                 rendering = asyncio.create_task(render_event(event))
@@ -491,11 +492,11 @@ class RepluxApp(App[None]):
             else:
                 await render_event(event)
 
-        async def render_event(event: StreamEvent) -> None:
+        async def render_event(event: AgentEvent) -> None:
             async with self.query_one(TranscriptScroll).preserve_reading_position():
                 await show_event(event)
 
-        async def show_event(event: StreamEvent) -> None:
+        async def show_event(event: AgentEvent) -> None:
             nonlocal reply, text, thinking, thinking_text, thinking_control
             self._follow_transcript()
             if isinstance(event, TextDelta):
@@ -550,7 +551,7 @@ class RepluxApp(App[None]):
             await transcript.mount(user)
             if self._cancelling:
                 raise asyncio.CancelledError
-            events = self._client.stream_reply(user_input)
+            events = self._agent.stream_reply(user_input)
             async with aclosing(events):
                 while True:
                     try:
@@ -595,4 +596,4 @@ class RepluxApp(App[None]):
                 except WorkerCancelled:
                     pass
         finally:
-            await self._client.aclose()
+            await self._agent.aclose()
